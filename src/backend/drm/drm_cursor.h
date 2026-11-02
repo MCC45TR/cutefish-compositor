@@ -58,6 +58,11 @@ public:
     // `position` is where the hotspot should land, in output pixels.
     void move(const base::Point& position);
 
+    // Whether a page flip on this CRTC has not landed yet. On a device whose
+    // cursor ioctls wait for it, a visible cursor meanwhile only keeps the
+    // newest image and position, which the plane takes once the flip is done.
+    void setFlipPending(bool pending);
+
     bool isVisible() const { return m_visible; }
 
 private:
@@ -68,6 +73,7 @@ private:
 
     DrmCursor(DrmDeviceApi* device, uint32_t crtcId, const base::Size& size,
               std::array<Buffer, 2> buffers);
+    bool holdsForFlip() const;
     bool upload();
 
     DrmDeviceApi* m_device = nullptr;
@@ -87,6 +93,10 @@ private:
     // Until the first move the plane stays where the previous DRM master left it.
     bool m_positioned = false;
     bool m_visible = false;
+    bool m_flipPending = false;
+    // Held back by a pending flip, still to reach the plane.
+    bool m_uploadDeferred = false;
+    bool m_moveDeferred = false;
     // Set once the driver has rejected drmModeSetCursor; retrying every frame
     // would be pointless.
     bool m_failed = false;

@@ -76,11 +76,21 @@ bool DrmCursor::setImage(const uint8_t* pixels, const base::Size& size, int stri
     if (size.width() > m_size.width() || size.height() > m_size.height())
         return false;
 
-    m_image.assign(reinterpret_cast<const char*>(pixels),
-                   size_t(stride) * (size.height() - 1) + size_t(size.width()) * 4);
+    const size_t bytes = size_t(stride) * (size.height() - 1) + size_t(size.width()) * 4;
+    // Every pointer enter, leave and cursor request sets the image again.
+    if (m_visible && size == m_imageSize && stride == m_imageStride && hotspot == m_hotspot
+        && m_image.size() == bytes && std::memcmp(m_image.data(), pixels, bytes) == 0) {
+        return true;
+    }
+
+    m_image.assign(reinterpret_cast<const char*>(pixels), bytes);
     m_imageSize = size;
     m_imageStride = stride;
     m_hotspot = hotspot;
+    if (m_visible && holdsForFlip()) {
+        m_uploadDeferred = true;
+        return true;
+    }
     return upload();
 }
 
@@ -89,12 +99,22 @@ void DrmCursor::setTint(const render::ColorTransform& tint)
     if (tint == m_tint)
         return;
     m_tint = tint;
-    if (m_visible && !m_image.empty())
+    if (!m_visible || m_image.empty())
+        return;
+    if (holdsForFlip())
+        m_uploadDeferred = true;
+    else
         upload();
+}
+
+bool DrmCursor::holdsForFlip() const
+{
+    return m_flipPending && m_device->cursorWaitsForFlips();
 }
 
 bool DrmCursor::upload()
 {
+    m_uploadDeferred = false;
     // Never write into the buffer the display is scanning out.
     const size_t back = m_visible ? (m_front ^ 1) : m_front;
     Buffer& buffer = m_buffers[back];
@@ -131,13 +151,17 @@ bool DrmCursor::upload()
     m_visible = true;
     // A new image on an already-positioned cursor still has to be placed: the
     // hotspot may have moved within the image.
-    if (m_positioned)
+    if (m_positioned) {
+        m_moveDeferred = false;
         m_device->moveCursor(m_crtcId, m_position - m_hotspot);
+    }
     return true;
 }
 
 void DrmCursor::hide()
 {
+    m_uploadDeferred = false;
+    m_moveDeferred = false;
     if (!m_visible)
         return;
     m_visible = false;
@@ -148,8 +172,30 @@ void DrmCursor::move(const base::Point& position)
 {
     m_position = position;
     m_positioned = true;
+    if (!m_visible)
+        return;
+    if (holdsForFlip()) {
+        m_moveDeferred = true;
+        return;
+    }
+    m_device->moveCursor(m_crtcId, position - m_hotspot);
+}
+
+void DrmCursor::setFlipPending(bool pending)
+{
+    m_flipPending = pending;
+    if (pending)
+        return;
+    // The upload places the cursor too.
+    if (m_uploadDeferred) {
+        upload();
+        return;
+    }
+    if (!m_moveDeferred)
+        return;
+    m_moveDeferred = false;
     if (m_visible)
-        m_device->moveCursor(m_crtcId, position - m_hotspot);
+        m_device->moveCursor(m_crtcId, m_position - m_hotspot);
 }
 
 } // namespace cutefish::backend

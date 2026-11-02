@@ -136,8 +136,8 @@ public:
 protected:
     void setTitles(std::string title, std::string settingsText);
     void setTitleDetail(std::string detail);
-    // A view of the panel's, centred on the title's capitals at the
-    // header's trailing end.
+    // A child of the panel itself, outside the body's clip, centred on the
+    // title's capitals at the header's trailing end.
     void setAccessory(ui::View *accessory);
     void setBodyVisible(bool visible);
     // What the body needs at the body column's width.
@@ -152,9 +152,8 @@ protected:
     double bodyMaximumHeight() const;
 
     ControlCenterServices &services() const { return m_services; }
-    // Where a panel's header accessory and body views go: clipped from the
-    // content padding down to the footer.
-    ui::View *header() const { return m_clip; }
+    // Where a panel's body views go: clipped from the content padding down to
+    // the footer.
     ui::View *body() const { return m_body; }
 
     void layout() override;
@@ -212,9 +211,11 @@ private:
     class List;
 
     double listHeight() const;
+    double listLead() const;
 
     ui::Switch *m_switch;
     ui::ScrollView *m_scroll;
+    ui::View *m_separator;
     List *m_list;
     PanelRow *m_hotspot;
     std::vector<PanelRow *> m_rows;
@@ -242,6 +243,7 @@ private:
     ui::Label *m_noOutput;
     LevelSlider *m_slider;
     ui::Label *m_heading;
+    ui::View *m_separator;
     std::vector<PanelRow *> m_rows;
     std::vector<AudioOutput> m_outputs;
 };

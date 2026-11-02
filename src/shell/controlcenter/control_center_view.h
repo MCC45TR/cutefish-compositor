@@ -7,12 +7,7 @@
 
 #include <functional>
 
-#include "base/timer.h"
 #include "ui/view.h"
-
-namespace cutefish::ui {
-class Label;
-}
 
 namespace cutefish::shell {
 
@@ -22,16 +17,14 @@ class DeviceUsersTile;
 class MediaTile;
 class TileSlider;
 
-// The control centre's content without its window: the title, the
-// device-users tile, the cards, the media card and the two sliders, 360 wide.
+// The control centre's content without its window: the device-users tile,
+// the cards, the media card and the two sliders, 360 wide.
 class ControlCenterView : public ui::View
 {
 public:
     static constexpr double kWidth = 360;
     // Between the tiles and round them.
     static constexpr double kGap = 10;
-    // The status panels' text inset, from the side and from the top.
-    static constexpr double kTitleInset = 16;
 
     explicit ControlCenterView(ControlCenterServices &services);
     ~ControlCenterView() override;
@@ -62,10 +55,8 @@ protected:
 
 private:
     double layoutHeight() const;
-    double headerHeight() const;
 
     ControlCenterServices &m_services;
-    ui::Label *m_title;
     DeviceUsersTile *m_users;
     CardItem *m_wireless;
     CardItem *m_bluetooth;
@@ -76,7 +67,6 @@ private:
     MediaTile *m_media;
     TileSlider *m_brightness;
     TileSlider *m_sound;
-    base::Timer m_brightnessTimer;
     bool m_darkModeShown = false;
 };
 
