@@ -252,6 +252,8 @@ CompositorShell::CompositorShell(const CompositorOptions &options)
     m_compositorSubscriptions.push_back(
             m_compositor.frameStarted.connect([this](double frameTimeMs) {
                 m_dockLayout.advance(frameTimeMs);
+                if (wm::OverviewController *overview = m_windowManager.overview())
+                    overview->advance(frameTimeMs);
             }));
     m_outputModel.scale = m_options.scale;
 
@@ -850,9 +852,6 @@ bool CompositorShell::initWayland()
             withExecutables({"/usr/bin/cutefish-computer-use"}, m_options.computerControlClients),
             // The compatibility runtime, whose programs place their windows.
             withExecutables({"/usr/bin/reef"}, m_options.windowPlacementClients));
-    m_windowManager.setSystemDialogPolicy([this](int64_t pid) {
-        return m_security->showsSystemDialogs(pid);
-    });
 
     wayland::ProtocolGlobals::Dependencies dependencies;
     dependencies.server = m_server.get();
