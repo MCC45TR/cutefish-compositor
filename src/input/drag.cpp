@@ -112,14 +112,28 @@ bool DragOffer::canDrop() const
             && (!m_source || (m_source->alive() && !m_mime.empty() && m_action));
 }
 
-bool DragOffer::drop()
+bool DragOffer::drop(const std::function<void()> &notifyDestination)
 {
     const auto alive = weak_from_this().lock();
     if (!canDrop())
         return false;
     m_state = State::Dropped;
-    if (m_source)
+    // A self-drop shares Chromium's source and destination controller. If
+    // dnd_drop_performed arrives first it can clear the destination while
+    // ending the nested drag loop, losing the drop and its finish request.
+    if (notifyDestination) {
+        m_deliveringDrop = true;
+        notifyDestination();
+        m_deliveringDrop = false;
+    }
+    if (m_source && m_source->alive() && m_state != State::Cancelled)
         m_source->dropPerformed();
+    // A destination in the compositor can finish while the drop is delivered;
+    // the source still hears dnd_drop_performed before dnd_finished.
+    if (std::exchange(m_finishDeferred, false) && m_source->alive()) {
+        m_source->finished();
+        m_source->invalidate();
+    }
     return true;
 }
 
@@ -139,6 +153,10 @@ bool DragOffer::finish()
     if (m_state != State::Dropped || !m_source || m_mime.empty() || !m_action || m_action == 4)
         return false;
     m_state = State::Finished;
+    if (m_deliveringDrop) {
+        m_finishDeferred = true;
+        return true;
+    }
     // A source gone since the drop has nobody left to tell; the finish is
     // still a timely one.
     if (m_source->alive()) {
@@ -467,9 +485,7 @@ void DragController::drop()
             if (auto offer = weak.lock(); offer && offer != selected)
                 offer->invalidate();
         }
-        if (selected->drop())
-            dropped(selected.get());
-        else if (source)
+        if (!selected->drop([&] { dropped(selected.get()); }) && source)
             source->cancel();
         if (target)
             left();

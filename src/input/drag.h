@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -46,7 +47,8 @@ public:
     void receive(const std::string& mime, int fd);
     bool finish();
     void invalidate();
-    bool drop();
+    // Deliver the destination drop before notifying the source of completion.
+    bool drop(const std::function<void()> &notifyDestination = {});
     bool canDrop() const;
 
     uint32_t action() const { return m_action; }
@@ -78,6 +80,8 @@ private:
     uint32_t m_action = 0;
     bool m_legacy;
     std::string m_mime;
+    bool m_deliveringDrop = false;
+    bool m_finishDeferred = false;
 };
 
 // Moves a window along with a drag, for xdg_toplevel_drag_v1. The data

@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numbers>
+#include <utility>
+#include <vector>
 
 #include "shell/common/count_badge.h"
 #include "shell/launcher/launcher_view.h"
@@ -50,12 +53,87 @@ public:
     bool acceptsPointer() const override { return true; }
 
 protected:
+    void paint(ui::Painter &painter) override
+    {
+        // A folder's preview draws in its place.
+        if (!m_cell->isFolder())
+            ui::ThemeIcon::paint(painter);
+    }
     void pointerPress(const ui::PointerEvent &event) override { m_cell->iconPressed(event); }
     void pointerMove(const ui::PointerEvent &event) override { m_cell->iconMoved(event); }
     void pointerRelease(const ui::PointerEvent &event) override { m_cell->iconReleased(event); }
 
 private:
     LauncherCell *m_cell;
+};
+
+// A folder's icon: a plate holding the first of its applications' icons,
+// three by three. It draws dimmed while the cell is pressed.
+class LauncherCell::FolderPreview final : public ui::View
+{
+public:
+    static constexpr size_t kColumns = 3;
+
+    explicit FolderPreview(LauncherCell *cell)
+        : m_cell(cell)
+    {
+        setName("launcher-folder-preview");
+    }
+
+    void setIcons(const std::vector<LauncherItem> &children)
+    {
+        const size_t count = std::min(children.size(), kColumns * kColumns);
+        while (m_icons.size() > count) {
+            takeChild(m_icons.back());
+            m_icons.pop_back();
+        }
+        while (m_icons.size() < count)
+            m_icons.push_back(addChild<ui::ThemeIcon>());
+        for (size_t i = 0; i < count; ++i) {
+            const std::string &name = children[i].iconName;
+            m_icons[i]->setIconName(name.empty() ? "application-x-desktop" : name);
+        }
+        requestLayout();
+    }
+
+    // The icon of the folder's application at `index`; null past the
+    // preview's nine.
+    ui::ThemeIcon *icon(size_t index) const { return index < m_icons.size() ? m_icons[index] : nullptr; }
+
+    void updatePressed()
+    {
+        const double opacity = m_cell->isPressDimmed() ? 0.6 : 1;
+        for (ui::ThemeIcon *icon : m_icons)
+            icon->setOpacity(opacity);
+        requestPaint();
+    }
+
+protected:
+    void layout() override
+    {
+        const double size = geometry().width;
+        const double padding = jsRound(size * 0.12);
+        const double gap = std::max(1, jsRound(size * 0.04));
+        const double icon = std::floor((size - 2 * padding - (kColumns - 1) * gap) / kColumns);
+        for (size_t i = 0; i < m_icons.size(); ++i) {
+            m_icons[i]->setSize(icon);
+            m_icons[i]->setGeometry({padding + double(i % kColumns) * (icon + gap),
+                                     padding + double(i / kColumns) * (icon + gap), icon, icon});
+        }
+    }
+
+    void paint(ui::Painter &painter) override
+    {
+        const ui::RectF bounds = localRect();
+        // Darkened rather than lightened while pressed.
+        const bool dimmed = m_cell->isPressDimmed();
+        const ui::Color plate = dimmed ? ui::Color {0, 0, 0, 255} : ui::Color {255, 255, 255, 255};
+        painter.drawSmoothRectangle(bounds, jsRound(bounds.width * 0.22), plate.withAlpha(dimmed ? 0.3 : 0.22));
+    }
+
+private:
+    LauncherCell *m_cell;
+    std::vector<ui::ThemeIcon *> m_icons;
 };
 
 LauncherCell::LauncherCell(LauncherView *view, std::string id)
@@ -76,8 +154,18 @@ LauncherCell::~LauncherCell() = default;
 
 void LauncherCell::setItem(const LauncherItem &item)
 {
-    if (item.iconName != m_iconName) {
-        m_iconName = item.iconName;
+    if (item.isFolder()) {
+        // The preview stands in for the icon, which only takes the pointer.
+        if (!m_preview) {
+            m_preview = addChild<FolderPreview>(this);
+            requestLayout();
+        }
+        m_preview->setIcons(item.children);
+        m_childCount = item.children.size();
+    }
+    const std::string iconName = item.isFolder() ? "folder" : item.iconName;
+    if (iconName != m_iconName) {
+        m_iconName = iconName;
         m_icon->setIconName(m_iconName.empty() ? "application-x-desktop" : m_iconName);
         if (m_mask)
             m_mask->setIconName(m_icon->iconName());
@@ -140,6 +228,8 @@ void LauncherCell::setDragging(bool dragging)
     m_pressed = false;
     m_icon->setVisible(!dragging);
     m_label->setVisible(!dragging);
+    if (m_preview)
+        m_preview->setVisible(!dragging);
     updateMask();
     updateCountBadge();
     requestPaint();
@@ -153,6 +243,14 @@ void LauncherCell::setMenuOpen(bool open)
     updateMask();
 }
 
+void LauncherCell::setMergeTarget(bool target)
+{
+    if (target == m_mergeTarget)
+        return;
+    m_mergeTarget = target;
+    requestPaint();
+}
+
 void LauncherCell::setBackdrop(ui::Color color)
 {
     if (color == m_backdrop)
@@ -164,6 +262,11 @@ void LauncherCell::setBackdrop(ui::Color color)
 
 void LauncherCell::updateMask()
 {
+    // A folder's preview dims itself.
+    if (m_preview) {
+        m_preview->updatePressed();
+        return;
+    }
     // Made on the first press, then only hidden: rasterising it for every
     // icon would cost each icon twice.
     if (isPressDimmed() && !m_mask) {
@@ -203,6 +306,42 @@ void LauncherCell::finishMove()
         m_moveX.finish();
     if (m_moveY.isRunning())
         m_moveY.finish();
+    if (m_folderTween.isRunning())
+        m_folderTween.finish();
+}
+
+void LauncherCell::playFolderAnimation(bool created)
+{
+    if (!m_preview)
+        return;
+    if (created) {
+        m_folderTween.start(window(), 0.6, 1, kFolderCreatedDuration, easing::outBack,
+                            [this](double scale) { m_preview->setTransform({{}, scale}); });
+        return;
+    }
+    // The application that went in is the folder's last.
+    const size_t added = m_childCount - 1;
+    m_folderTween.start(window(), 0, 1, kFolderAddedDuration, easing::linear, [this, added](double t) {
+        // Up by 12% and back, exactly at rest at the end.
+        const double scale = t < 1 ? 1 + 0.12 * std::sin(std::numbers::pi * t) : 1;
+        m_preview->setTransform({{}, scale});
+        if (ui::ThemeIcon *icon = m_preview->icon(added))
+            icon->setOpacity(t);
+    });
+}
+
+ui::Bitmap LauncherCell::dragImage(double scale)
+{
+    if (!m_preview)
+        return ui::themeIconBitmap(m_iconName.empty() ? "application-x-desktop" : m_iconName,
+                                   m_metrics.iconSize, scale);
+    // Not dimmed by the press the drag starts from.
+    const bool pressed = std::exchange(m_pressed, false);
+    m_preview->updatePressed();
+    ui::Bitmap image = m_preview->grab(scale);
+    m_pressed = pressed;
+    m_preview->updatePressed();
+    return image;
 }
 
 ui::RectF LauncherCell::iconRect() const
@@ -257,6 +396,8 @@ void LauncherCell::layout()
     m_icon->setGeometry(icon);
     if (m_mask)
         m_mask->setGeometry(icon);
+    if (m_preview)
+        m_preview->setGeometry(icon);
     updateCountBadge();
     const ui::RectF label = labelArea(m_metrics);
     // Lines the label's height cannot hold go before the maximum:
@@ -268,6 +409,12 @@ void LauncherCell::layout()
 
 void LauncherCell::paint(ui::Painter &painter)
 {
+    if (m_mergeTarget && !m_dragging) {
+        const ui::RectF icon = iconRect();
+        const double grow = jsRound(icon.width * 0.12);
+        const ui::RectF plate = icon.adjusted(-grow, -grow, grow, grow);
+        painter.drawSmoothRectangle(plate, jsRound(plate.width * 0.22), inkOn(m_backdrop, 0.25));
+    }
     const ui::RectF selection = selectionRect();
     if (selection.width > 0)
         painter.drawRoundedRect(selection,

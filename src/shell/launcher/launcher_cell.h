@@ -5,12 +5,14 @@
 #ifndef CUTEFISH_SHELL_LAUNCHER_LAUNCHER_CELL_H_
 #define CUTEFISH_SHELL_LAUNCHER_LAUNCHER_CELL_H_
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 
 #include "shell/launcher/launcher_metrics.h"
 #include "shell/launcher/launcher_model.h"
 #include "shell/launcher/launcher_tween.h"
+#include "ui/bitmap.h"
 #include "ui/view.h"
 
 namespace cutefish::ui {
@@ -23,10 +25,12 @@ namespace cutefish::shell {
 class CountBadge;
 class LauncherView;
 
-// One application in the launcher's grid: its icon and its count,
-// its name in up to two lines, the new mark, the keyboard selection and the
-// pressed silhouette. Only the icon takes the pointer; the rest of the cell
-// is the page behind it.
+// One application or folder in the launcher's grid: its icon (a folder's
+// shows the first of its applications on a plate) and its count, its name in
+// up to two lines, the new mark, the keyboard selection, the pressed
+// silhouette, and a plate behind the icon while a drop there would make a
+// folder. Only the icon takes the pointer; the rest of the cell is the page
+// behind it.
 class LauncherCell final : public ui::View
 {
 public:
@@ -34,6 +38,7 @@ public:
     ~LauncherCell() override;
 
     const std::string &id() const { return m_id; }
+    bool isFolder() const { return LauncherItem::isFolderId(m_id); }
 
     void setItem(const LauncherItem &item);
     // The application's count on the icon's corner; 0 for none.
@@ -51,6 +56,9 @@ public:
     // Its icon and name hide while it is dragged.
     void setDragging(bool dragging);
     void setMenuOpen(bool open);
+    // An application dragged over the icon would make a folder with it.
+    void setMergeTarget(bool target);
+    bool isMergeTarget() const { return m_mergeTarget; }
     bool isPressDimmed() const { return (m_pressed || m_menuOpen) && !m_dragging; }
     // The colour the selection is inked against.
     void setBackdrop(ui::Color color);
@@ -59,7 +67,20 @@ public:
     // when `animate`.
     void moveTo(const ui::PointF &position, bool animate);
     bool isMoving() const { return m_moveX.isRunning() || m_moveY.isRunning(); }
+    // Jumps to the end of the move and of the folder's animation.
     void finishMove();
+
+    static constexpr std::chrono::milliseconds kFolderCreatedDuration {360};
+    static constexpr std::chrono::milliseconds kFolderAddedDuration {300};
+    // A folder just made of two applications pops up out of a smaller
+    // preview; one that has just taken another bumps, the new application's
+    // icon fading in. Nothing for an application.
+    void playFolderAnimation(bool created);
+    bool isPlayingFolderAnimation() const { return m_folderTween.isRunning(); }
+
+    // What a drag of the cell carries: the application's icon, or the
+    // folder's preview as it shows at rest. Device pixels at `scale`.
+    ui::Bitmap dragImage(double scale);
 
     // In the cell's coordinates.
     ui::RectF iconRect() const;
@@ -79,6 +100,7 @@ protected:
 
 private:
     class Icon;
+    class FolderPreview;
 
     void updateMask();
     void updateCountBadge();
@@ -91,6 +113,8 @@ private:
     int m_page = 0;
     int m_index = 0;
     Icon *m_icon = nullptr;
+    // A folder's, over its icon.
+    FolderPreview *m_preview = nullptr;
     ui::ThemeIcon *m_mask = nullptr;
     // Above the icon and its pressed look.
     CountBadge *m_countBadge = nullptr;
@@ -99,12 +123,16 @@ private:
     bool m_selected = false;
     bool m_dragging = false;
     bool m_menuOpen = false;
+    bool m_mergeTarget = false;
     bool m_pressed = false;
     // One drag per press.
     bool m_dragArmed = false;
     ui::PointF m_pressPoint;
     LauncherSpring m_moveX;
     LauncherSpring m_moveY;
+    LauncherTween m_folderTween;
+    // A folder's applications.
+    size_t m_childCount = 0;
 };
 
 } // namespace cutefish::shell
