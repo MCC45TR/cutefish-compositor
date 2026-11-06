@@ -1,8 +1,8 @@
 # Cutefish Compositor
 
 The Cutefish Wayland compositor, with window management, the desktop shell,
-the lock screen and Xwayland in one process. Much of it is ported from
-Chromium's Exo and Ash.
+the lock screen and Xwayland in one process. Its Wayland server and window
+management are designed after Chromium's Exo and Ash.
 
 ## Dependencies
 
@@ -31,10 +31,13 @@ reference:
   reimplemented from [IOHIDFamily](https://github.com/apple-oss-distributions/IOHIDFamily)
   (Apple Public Source License 2.0): `IOHIDParametricAcceleration`'s
   parametric curve. Its curve table is the `HIDAccelCurves` table of
-  IOHIDFamily's generic HID pointer, converted from 16.16 fixed point.
+  IOHIDFamily's generic HID pointer, converted from 16.16 fixed point, so
+  the file is under the APSL 2.0; see [LICENSE.apsl](LICENSE.apsl).
 
 ## License
 
-BSD-3-Clause; see [LICENSE](LICENSE). Code ported from Chromium keeps its
-original notice in [LICENSE.chromium](LICENSE.chromium), and code from
-sommelier in [LICENSE.sommelier](LICENSE.sommelier).
+BSD-3-Clause; see [LICENSE](LICENSE). Files that follow Chromium's code keep
+its notice in [LICENSE.chromium](LICENSE.chromium), code from sommelier
+in [LICENSE.sommelier](LICENSE.sommelier), and
+`src/input/pointer_acceleration.cpp` is under the APSL 2.0
+([LICENSE.apsl](LICENSE.apsl)).
