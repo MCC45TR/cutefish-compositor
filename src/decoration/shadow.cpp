@@ -91,7 +91,7 @@ Run longestStraightRun(const std::vector<std::vector<ui::PointF>> &polygons, boo
 ShadowGeometry::ShadowGeometry(const base::Size &windowSize, int radius, const ShadowStyle &style,
                                int rasterScale, const Corners &corners,
                                const ui::Path &silhouette)
-    : m_radius(radius)
+    : m_radius(std::min(radius, kMaxRadius))
     , m_scale(rasterScale)
     , m_corners(corners)
     , m_style(style)
@@ -100,8 +100,8 @@ ShadowGeometry::ShadowGeometry(const base::Size &windowSize, int radius, const S
     // Internal assets have a bounded physical footprint. Scale 1 is the output
     // contract today; integer raster scales 2..4 are exercised independently.
     if (windowSize.isEmpty() || windowSize.width() > (1 << 20) || windowSize.height() > (1 << 20)
-        || rasterScale < 1 || rasterScale > 4 || radius < 0 || radius > kMaxRadius
-        || radius > windowSize.width() / 2 || radius > windowSize.height())
+        || rasterScale < 1 || rasterScale > 4 || m_radius < 0
+        || m_radius > windowSize.width() / 2 || m_radius > windowSize.height())
         return;
 
     int support = 0;
@@ -296,6 +296,17 @@ render::Texture *shadowTexture(render::Renderer &renderer, const ShadowGeometry 
     return textures.front().get();
 }
 
+// `start` to `end` with both corners on physical pixels. The renderer widens
+// a target to every pixel it touches, so a slice edge inside a pixel would
+// paint that pixel under both slices that meet there.
+base::RectF placeSlice(const render::Renderer &renderer, const base::PointF &start,
+                       const base::PointF &end)
+{
+    const base::PointF first = renderer.pixelAligned(start);
+    const base::PointF last = renderer.pixelAligned(end);
+    return base::RectF::fromEdges(first.x(), first.y(), last.x(), last.y());
+}
+
 // The unit square of a slice to `source`, in texture coordinates of `size`.
 base::AffineTransform sliceMapping(const base::RectF &source, const base::SizeF &size)
 {
@@ -333,8 +344,8 @@ void paintShadow(render::Renderer &renderer, const ShadowGeometry &geometry,
         const base::PointF end(
                 place(target.x() + target.width(), window.width(), body.left(), body.right()),
                 place(target.y() + target.height(), window.height(), body.top(), body.bottom()));
-        const base::RectF placed = base::RectF::fromEdges(start.x(), start.y(), end.x(), end.y());
-        if (!renderer.drawsInto(placed.toEnclosingRect()))
+        const base::RectF placed = placeSlice(renderer, start, end);
+        if (placed.isEmpty() || !renderer.drawsInto(placed.toEnclosingRect()))
             continue;
         // A stretched cut lies in a constant run and any other joins slices
         // drawn at one scale, so filtering across it reads what one image would.
@@ -390,15 +401,15 @@ void paintStretchedShadow(render::Renderer &renderer, const ShadowGeometry &geom
                                         map(top, from.height(), window.height()));
                 const base::Point end(map(right, from.width(), window.width()),
                                       map(bottom, from.height(), window.height()));
-                const base::Rect placed =
-                        base::Rect(start, base::Size(end.x() - start.x(), end.y() - start.y()))
-                                .translated(window.origin());
-                if (placed.isEmpty() || !renderer.drawsInto(placed))
+                const base::RectF placed =
+                        placeSlice(renderer, base::PointF(start + window.origin()),
+                                   base::PointF(end + window.origin()));
+                if (placed.isEmpty() || !renderer.drawsInto(placed.toEnclosingRect()))
                     continue;
                 const base::RectF piece(source.x() + (left - target.x()) * sx,
                                         source.y() + (top - target.y()) * sy, (right - left) * sx,
                                         (bottom - top) * sy);
-                slices.push_back({base::RectF(placed), sliceMapping(piece, base::SizeF(image->size()))});
+                slices.push_back({placed, sliceMapping(piece, base::SizeF(image->size()))});
             }
         }
     }

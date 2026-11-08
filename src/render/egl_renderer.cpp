@@ -850,6 +850,20 @@ void EglRenderer::alignTextureDraw(const Texture *texture, const base::RectF &ta
                         * mapping;
             // Like Exo's host origin adjustment, keep native-density texels on physical pixels.
             aligned = base::RectF(pixelAligned(target.topLeft()), base::SizeF(deviceSize) / rasterScale());
+            return;
+        }
+        // A buffer scaled to the output covers every physical pixel its edges
+        // touch, the edge texels clamped over the rest: a surface beside or
+        // above another one (a subsurface over a hole in its parent) leaves
+        // no partly covered pixel row between them.
+        if (mapping.m12() == 0 && mapping.m21() == 0 && target.width() > 0 && target.height() > 0) {
+            const base::RectF outer = pixelsAround(target);
+            const auto toTarget = base::AffineTransform(outer.width() / target.width(), 0, 0,
+                                                        outer.height() / target.height(),
+                                                        (outer.x() - target.x()) / target.width(),
+                                                        (outer.y() - target.y()) / target.height());
+            texelMapping = toTarget * mapping;
+            aligned = outer;
         }
     }
 }
@@ -963,6 +977,11 @@ void EglRenderer::drawTextureQuads(GlTexture *glTexture, const TextureQuad *quad
 bool EglRenderer::keepsBackdrop(uint64_t scope, uint64_t owner) const
 {
     return m_backdrop && m_backdrop->keeps(scope, owner);
+}
+
+std::optional<base::Rect> EglRenderer::keptBackdropChange(uint64_t scope, uint64_t owner) const
+{
+    return m_backdrop ? m_backdrop->keptChange(scope, owner) : std::nullopt;
 }
 
 void EglRenderer::beginBackdropPass(uint64_t scope, const std::vector<KeptBackdrop> &fresh)

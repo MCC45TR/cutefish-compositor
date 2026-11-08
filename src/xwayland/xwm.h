@@ -55,6 +55,7 @@ public:
     // X11 pixels per logical unit. Xwayland draws at device resolution, so
     // every coordinate crossing between X11 and the window manager is scaled.
     void setScale(double scale);
+    void setCursorTheme(const std::string &theme, int size);
     // How long a client has to answer _NET_WM_PING.
     void setPingTimeout(int milliseconds) { m_pingTimeoutMs = milliseconds; }
     void setWindowLimit(size_t limit) { m_windowLimit = limit; }
@@ -107,9 +108,24 @@ private:
     base::Size sizeFromX(const base::Size &size) const;
     base::Size sizeToX(const base::Size &size) const;
     base::Region regionFromX(const base::Region &region) const;
-    void publishDpi();
+    // An X11 window's rectangle and the body of it the window manager places,
+    // which leaves out the shadow the client declares in _GTK_FRAME_EXTENTS.
+    base::Rect bodyFromX(const X11Window &window, const base::Rect &xRect) const;
+    base::Rect bodyToX(const X11Window &window, const base::Rect &rect) const;
+    // A size hint covers the whole X11 window, that shadow included.
+    base::Size hintFromX(const X11Window &window, const base::Size &size) const;
+    wm::Insets exterior(const X11Window &window) const;
+    // Xft.dpi and the cursor theme, in the root window's resources and in
+    // XSETTINGS.
+    void publishResources();
     void ping(uint32_t window);
     bool requestSync(X11Window &window);
+    // The client's sync counter passed the last request, or it timed out.
+    void syncReached(X11Window &window);
+    // A cross-fade keeps the window's old picture until the client has
+    // committed what it painted at the size it was last sent.
+    void holdContent(X11Window &window);
+    void releaseContent(X11Window &window);
     void kill(uint32_t window);
     static uint32_t ownerPid(const X11Window &window);
     static std::string displayTitle(const X11Window &window);
@@ -140,6 +156,8 @@ private:
     xcb_void_cookie_t m_redirection {};
     base::Rect m_lastOutput, m_lastWorkArea;
     double m_scale = 1;
+    std::string m_cursorTheme = "default";
+    int m_cursorSize = 24;
     bool m_xsettings = false;
     uint32_t m_xsettingsSerial = 0;
     int m_pingTimeoutMs = 5000;

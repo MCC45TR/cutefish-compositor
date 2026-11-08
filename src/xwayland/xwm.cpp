@@ -11,6 +11,7 @@
 #include "xwm.h"
 
 #include "scene/surface_node.h"
+#include "scene/window_animation.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -21,6 +22,7 @@
 #include <climits>
 #include <csignal>
 #include <unistd.h>
+#include <variant>
 #include <xcb/composite.h>
 #include <xcb/shape.h>
 #include <xcb/sync.h>
@@ -32,6 +34,7 @@
 #include "base/strings.h"
 #include "compositor/surface.h"
 #include "core/main_loop.h"
+#include "cursor/theme.h"
 #include "dnd_bridge.h"
 #include "fd_watch.h"
 #include "input/seat.h"
@@ -109,6 +112,7 @@ const char *const atomNames[] = {"WL_SURFACE_SERIAL",
                                  "_NET_WM_WINDOW_TYPE_DND",
                                  "_NET_WM_WINDOW_TYPE_NOTIFICATION",
                                  "_MOTIF_WM_HINTS",
+                                 "_GTK_FRAME_EXTENTS",
                                  "_NET_FRAME_EXTENTS",
                                  "_NET_REQUEST_FRAME_EXTENTS",
                                  "_NET_WM_MOVERESIZE",
@@ -247,6 +251,8 @@ struct Xwm::X11Window : compositor::SurfaceObserver, wm::WindowObserver {
     // No maximum: an empty size.
     base::Size minimum {1, 1}, maximum, increment {1, 1}, base {0, 0};
     bool mapped = false, overrideRedirect = false, decorated = true;
+    // _GTK_FRAME_EXTENTS, in X11 pixels: the shadow the client draws around its body.
+    wm::Insets extents;
     bool input = true, takeFocus = false, deleteWindow = false, pingable = false;
     // Requested through _NET_WM_STATE; there is no pager, but the state is kept.
     bool above = false, skipTaskbar = false, skipPager = false;
@@ -261,6 +267,12 @@ struct Xwm::X11Window : compositor::SurfaceObserver, wm::WindowObserver {
     xcb_sync_counter_t syncCounter = 0;
     xcb_sync_alarm_t syncAlarm = 0;
     int64_t syncValue = 0;
+    // The size last sent whose painted content has not been committed, in
+    // X11 pixels; synced once the client's counter has passed it, as only a
+    // commit after that holds what it painted rather than a bare new buffer.
+    std::optional<base::Size> awaitedSize;
+    bool awaitedSynced = false;
+    uint64_t awaitRevision = 0;
     bool metadataReady = false, syncing = false;
     bool propertiesPending = false;
     // Changed while a read was on its way, to be read again once it lands.
@@ -291,15 +303,26 @@ struct Xwm::X11Window : compositor::SurfaceObserver, wm::WindowObserver {
 
     void onSurfaceDestroying(compositor::Surface *) override { xwm->detach(*this); }
 
-    void onSurfaceCommit(compositor::Surface *) override { xwm->present(*this); }
+    void onSurfaceCommit(compositor::Surface *surface) override
+    {
+        if (awaitedSize && awaitedSynced && surface->bufferSize() == *awaitedSize)
+            xwm->releaseContent(*this);
+        xwm->present(*this);
+    }
 
     void onWindowDestroying(wm::Window *) override { window = nullptr; }
 
-    void onWindowBoundsChanged(wm::Window *, const base::Rect &) override { xwm->synchronize(*this); }
+    void onWindowBoundsChanged(wm::Window *, const base::Rect &) override
+    {
+        xwm->synchronize(*this);
+        xwm->holdContent(*this);
+    }
 
+    // Comes after the state's cross-fade has started.
     void onWindowStateTypeChanged(wm::Window *, wm::WindowStateType) override
     {
         xwm->synchronize(*this);
+        xwm->holdContent(*this);
     }
 
     void onWindowFrameChanged(wm::Window *) override { xwm->synchronize(*this); }
@@ -470,6 +493,31 @@ base::Size Xwm::sizeToX(const base::Size &size) const
                       std::max(1, base::roundToInt(size.height() * m_scale)));
 }
 
+base::Rect Xwm::bodyFromX(const X11Window &w, const base::Rect &xRect) const
+{
+    const base::Rect body = w.extents.inset(xRect);
+    return base::Rect(fromX(body.topLeft()), sizeFromX(body.size()));
+}
+
+base::Rect Xwm::bodyToX(const X11Window &w, const base::Rect &rect) const
+{
+    return w.extents.outset(base::Rect(toX(rect.topLeft()), sizeToX(rect.size())));
+}
+
+base::Size Xwm::hintFromX(const X11Window &w, const base::Size &size) const
+{
+    return sizeFromX(w.extents.inset(size));
+}
+
+wm::Insets Xwm::exterior(const X11Window &w) const
+{
+    auto x = [this](int value) {
+        return base::roundToInt(value / m_scale);
+    };
+    return wm::Insets {x(w.extents.left), x(w.extents.top), x(w.extents.right),
+                       x(w.extents.bottom)};
+}
+
 base::Region Xwm::regionFromX(const base::Region &region) const
 {
     if (m_scale == 1)
@@ -488,13 +536,18 @@ base::Region Xwm::regionFromX(const base::Region &region) const
 // X11 clients scale themselves: Qt and Xft read Xft.dpi, GTK reads XSETTINGS.
 // The values follow gsd-xsettings: GTK takes an integer window scale and keeps
 // any fraction as a larger font DPI.
-void Xwm::publishDpi()
+void Xwm::publishResources()
 {
     const int dpi = base::roundToInt(96 * m_scale);
+    // X11 cursors are in X11 pixels, unscaled. Between two sizes the theme has
+    // X11 clients would take either; named exactly, they take the one the
+    // compositor draws.
+    int cursorSize = base::roundToInt(m_cursorSize * m_scale);
+    cursor::load(input::CursorShape::Default, cursorSize, m_cursorTheme, &cursorSize);
     reply(xcb_get_property(m_connection, 0, m_root, XCB_ATOM_RESOURCE_MANAGER, XCB_ATOM_STRING, 0,
                            65536)
                   .sequence,
-          [this, dpi](void *p) {
+          [this, dpi, cursorSize](void *p) {
               auto *r = static_cast<xcb_get_property_reply_t *>(p);
               std::vector<std::string> lines;
               if (r && r->type == XCB_ATOM_STRING && r->format == 8) {
@@ -502,11 +555,15 @@ void Xwm::publishDpi()
                           static_cast<const char *>(xcb_get_property_value(r)),
                           size_t(xcb_get_property_value_length(r)));
                   for (const std::string_view line : base::strings::splitViews(resources, '\n')) {
-                      if (!line.empty() && !line.starts_with("Xft.dpi:"))
+                      if (!line.empty() && !line.starts_with("Xft.dpi:")
+                          && !line.starts_with("Xcursor.theme:")
+                          && !line.starts_with("Xcursor.size:"))
                           lines.emplace_back(line);
                   }
               }
               lines.push_back("Xft.dpi:\t" + std::to_string(dpi));
+              lines.push_back("Xcursor.theme:\t" + m_cursorTheme);
+              lines.push_back("Xcursor.size:\t" + std::to_string(cursorSize));
               const std::string value = base::strings::join(lines, "\n") + '\n';
               xcb_change_property(m_connection, XCB_PROP_MODE_REPLACE, m_root,
                                   XCB_ATOM_RESOURCE_MANAGER, XCB_ATOM_STRING, 8, value.size(),
@@ -516,13 +573,19 @@ void Xwm::publishDpi()
     if (!m_xsettings)
         return;
     const int windowScale = std::max(1, int(std::floor(m_scale)));
-    const std::pair<const char *, int32_t> settings[] = {
+    const std::pair<const char *, std::variant<int32_t, std::string>> settings[] = {
             {"Gdk/UnscaledDPI", dpi * 1024 / windowScale},
             {"Gdk/WindowScalingFactor", windowScale},
+            {"Gtk/CursorThemeName", m_cursorTheme},
+            {"Gtk/CursorThemeSize", cursorSize},
             {"Xft/DPI", dpi * 1024}};
     std::string data;
     auto append = [&data](auto value) {
         data.append(reinterpret_cast<const char *>(&value), sizeof(value));
+    };
+    auto padded = [&data](std::string_view text) {
+        data.append(text);
+        data.append((4 - text.size() % 4) % 4, '\0');
     };
     append(uint8_t(std::endian::native == std::endian::little ? 0 : 1));
     data.append(3, '\0');
@@ -530,13 +593,18 @@ void Xwm::publishDpi()
     append(uint32_t(std::size(settings)));
     for (const auto &[name, value] : settings) {
         const std::string_view key(name);
-        append(uint8_t(0));
+        const auto *text = std::get_if<std::string>(&value);
+        append(uint8_t(text ? 1 : 0));
         data.append(1, '\0');
         append(uint16_t(key.size()));
-        data.append(key);
-        data.append((4 - key.size() % 4) % 4, '\0');
+        padded(key);
         append(uint32_t(m_xsettingsSerial));
-        append(value);
+        if (text) {
+            append(uint32_t(text->size()));
+            padded(*text);
+        } else {
+            append(std::get<int32_t>(value));
+        }
     }
     xcb_change_property(m_connection, XCB_PROP_MODE_REPLACE, m_support,
                         atom("_XSETTINGS_SETTINGS"), atom("_XSETTINGS_SETTINGS"), 8, data.size(),
@@ -647,12 +715,56 @@ bool Xwm::requestSync(X11Window &w)
               if (it == m_windows.end() || it->second->generation != generation
                   || !it->second->syncPending || it->second->syncValue != requested)
                   return;
-              auto &w = *it->second;
-              w.syncPending = false;
-              if (std::exchange(w.syncDeferred, false))
-                  synchronize(w);
+              syncReached(*it->second);
           });
     return true;
+}
+
+void Xwm::syncReached(X11Window &w)
+{
+    w.syncPending = false;
+    if (std::exchange(w.syncDeferred, false))
+        synchronize(w);
+    if (w.syncPending || !w.awaitedSize)
+        return;
+    w.awaitedSynced = true;
+    // Xwayland may have committed the painted buffer before the alarm reached us.
+    after(std::chrono::milliseconds(100), [this, id = w.id, generation = w.generation,
+                                           revision = w.awaitRevision] {
+        auto it = m_windows.find(id);
+        if (it != m_windows.end() && it->second->generation == generation
+            && it->second->awaitRevision == revision)
+            releaseContent(*it->second);
+    });
+}
+
+void Xwm::holdContent(X11Window &w)
+{
+    if (!w.window || !w.awaitedSize)
+        return;
+    auto *animation = dynamic_cast<scene::WindowAnimation *>(w.window->node());
+    if (!animation || !animation->isRunning()
+        || !scene::WindowAnimation::isCrossFade(animation->type()))
+        return;
+    animation->setBoundsContentReady(false);
+    // A client that never paints at the size must not stop the transition.
+    after(std::chrono::milliseconds(kSyncTimeoutMs), [this, id = w.id, generation = w.generation,
+                                                      revision = w.awaitRevision] {
+        auto it = m_windows.find(id);
+        if (it != m_windows.end() && it->second->generation == generation
+            && it->second->awaitRevision == revision)
+            releaseContent(*it->second);
+    });
+}
+
+void Xwm::releaseContent(X11Window &w)
+{
+    w.awaitedSize.reset();
+    ++w.awaitRevision;
+    if (!w.window)
+        return;
+    if (auto *animation = dynamic_cast<scene::WindowAnimation *>(w.window->node()))
+        animation->setBoundsContentReady(true);
 }
 
 void Xwm::applyStateRequest(X11Window &w, const std::array<uint32_t, 3> &request)
@@ -694,6 +806,16 @@ void Xwm::applyHints(X11Window &w)
     w.surface->setSkipTaskbar(w.skipTaskbar);
 }
 
+void Xwm::setCursorTheme(const std::string &theme, int size)
+{
+    if (theme == m_cursorTheme && size == m_cursorSize)
+        return;
+    m_cursorTheme = theme;
+    m_cursorSize = size;
+    if (m_ready)
+        publishResources();
+}
+
 void Xwm::setScale(double scale)
 {
     if (scale <= 0 || scale == m_scale)
@@ -702,7 +824,7 @@ void Xwm::setScale(double scale)
     if (!m_ready)
         return;
     roots();
-    publishDpi();
+    publishResources();
     for (auto &[id, w] : m_windows) {
         if (w->window) {
             synchronize(*w);
@@ -884,9 +1006,9 @@ void Xwm::setup()
                                                XCB_EVENT_MASK_STRUCTURE_NOTIFY,
                                                reinterpret_cast<const char *>(&e));
                                 m_xsettings = true;
-                                publishDpi();
+                                publishResources();
                             });
-                      publishDpi();
+                      publishResources();
                   }
                   if (initialized)
                       initialized(m_ready);
@@ -1027,7 +1149,7 @@ std::vector<xcb_atom_t> Xwm::followedProperties()
             atom("WM_PROTOCOLS"),      atom("_MOTIF_WM_HINTS"),     atom("_NET_WM_STATE"),
             atom("_NET_WM_WINDOW_TYPE"), atom("WM_CLIENT_LEADER"), atom("_NET_STARTUP_ID"),
             atom("WM_CLIENT_MACHINE"),   atom("_NET_WM_SYNC_REQUEST_COUNTER"),
-            atom("_NET_WM_WINDOW_OPACITY")};
+            atom("_NET_WM_WINDOW_OPACITY"), atom("_GTK_FRAME_EXTENTS")};
 }
 
 void Xwm::properties(X11Window &w, std::vector<xcb_atom_t> atoms)
@@ -1196,6 +1318,14 @@ void Xwm::properties(X11Window &w, std::vector<xcb_atom_t> atoms)
                       w.decorated = true;
                       if (r->type == a && count >= 3 && (words[0] & 2))
                           w.decorated = words[2] & 1 ? !(words[2] & (1 << 3)) : words[2] & (1 << 3);
+                  } else if (a == atom("_GTK_FRAME_EXTENTS")) {
+                      w.extents = wm::Insets();
+                      if (r->type == XCB_ATOM_CARDINAL && count >= 4) {
+                          auto extent = [words](int i) {
+                              return int(std::min<uint32_t>(words[i], 4096));
+                          };
+                          w.extents = wm::Insets {extent(0), extent(2), extent(1), extent(3)};
+                      }
                   } else if (a == XCB_ATOM_WM_NORMAL_HINTS) {
                       w.minimum = base::Size(1, 1);
                       w.maximum = base::Size();
@@ -1281,8 +1411,8 @@ void Xwm::properties(X11Window &w, std::vector<xcb_atom_t> atoms)
         if (w.window) {
             w.window->setTitle(displayTitle(w));
             w.window->setApplicationId(applicationId(w));
-            w.window->setMinimumSize(sizeFromX(w.minimum));
-            w.window->setMaximumSize(w.maximum.isEmpty() ? base::Size() : sizeFromX(w.maximum));
+            w.window->setMinimumSize(hintFromX(w, w.minimum));
+            w.window->setMaximumSize(w.maximum.isEmpty() ? base::Size() : hintFromX(w, w.maximum));
             w.window->setDecorated(w.decorated);
             w.window->setOpacity(w.opacity);
             w.window->setFocusPolicy(w.input || w.takeFocus ? wm::FocusPolicy::Normal
@@ -1333,9 +1463,13 @@ void Xwm::present(X11Window &w)
         const auto edge = m_manager->eventHandler()->draggedWindow() == w.window
                 ? m_manager->eventHandler()->draggedEdge()
                 : wm::ResizeEdge::None;
-        const auto delta = w.window->contentBounds().size() - w.surface->contentSize();
+        const wm::Insets exterior = this->exterior(w);
+        w.window->setClientExteriorInsets(exterior);
+        const auto delta =
+                w.window->contentBounds().size() - exterior.inset(w.surface->contentSize());
         w.window->setSurfaceOrigin(base::Point(wm::isLeftEdge(edge) ? delta.width() : 0,
-                                          wm::isTopEdge(edge) ? delta.height() : 0));
+                                               wm::isTopEdge(edge) ? delta.height() : 0)
+                                   - exterior.topLeft());
         return;
     }
     wm::WindowInit init;
@@ -1343,9 +1477,9 @@ void Xwm::present(X11Window &w)
     init.applicationId = applicationId(w);
     init.processId = ownerPid(w);
     init.decorated = w.decorated;
-    init.requestedSize = w.surface->contentSize();
-    init.minimumSize = sizeFromX(w.minimum);
-    init.maximumSize = w.maximum.isEmpty() ? base::Size() : sizeFromX(w.maximum);
+    init.requestedSize = exterior(w).inset(w.surface->contentSize());
+    init.minimumSize = hintFromX(w, w.minimum);
+    init.maximumSize = w.maximum.isEmpty() ? base::Size() : hintFromX(w, w.maximum);
     init.focusPolicy = w.input || w.takeFocus ? wm::FocusPolicy::Normal : wm::FocusPolicy::NoFocus;
     auto parent = m_windows.find(w.transient);
     init.transientParent = parent == m_windows.end() ? nullptr : parent->second->window;
@@ -1377,8 +1511,8 @@ void Xwm::present(X11Window &w)
     property(w.id, "_NET_WM_DESKTOP", XCB_ATOM_CARDINAL, {0});
     w.window->addObserver(&w);
     w.window->setOpacity(w.opacity);
-    w.window->setMinimumSize(sizeFromX(w.minimum));
-    w.window->setMaximumSize(w.maximum.isEmpty() ? base::Size() : sizeFromX(w.maximum));
+    w.window->setMinimumSize(hintFromX(w, w.minimum));
+    w.window->setMaximumSize(w.maximum.isEmpty() ? base::Size() : hintFromX(w, w.maximum));
     if (w.maximized)
         w.window->maximize();
     if (w.fullscreen)
@@ -1508,7 +1642,7 @@ void Xwm::synchronize(X11Window &w)
     base::Rect rect = w.window->contentBounds();
     // Size hints are in X11 pixels, so the increments are applied there; a
     // character cell is not a whole number of logical units at every scale.
-    base::Size xSize = sizeToX(rect.size());
+    base::Size xSize = w.extents.outset(sizeToX(rect.size()));
     if (w.window->stateType() == wm::WindowStateType::Normal) {
         base::Size constrained = xSize;
         constrained.setWidth(constrainedExtent(xSize.width(), w.base.width(), w.increment.width(),
@@ -1517,26 +1651,31 @@ void Xwm::synchronize(X11Window &w)
                                                 w.increment.height(), w.minimum.height(),
                                                 w.maximum.height()));
         if (constrained != xSize) {
-            const base::Size size = sizeFromX(constrained);
+            const base::Size size = sizeFromX(w.extents.inset(constrained));
             if (size != rect.size()) {
                 w.window->setBounds(base::Rect(w.window->bounds().topLeft(),
                                                w.window->frameInsets().outset(size)));
                 rect = w.window->contentBounds();
             }
-            xSize = rect.size() == size ? constrained : sizeToX(rect.size());
+            xSize = rect.size() == size ? constrained : w.extents.outset(sizeToX(rect.size()));
         }
     }
     present(w);
-    w.geometry = rect;
-    const base::Point xPosition = toX(rect.topLeft());
+    w.geometry = exterior(w).outset(rect);
+    const base::Point xPosition = bodyToX(w, rect).topLeft();
     // A client that paints to a sync counter takes one size at a time; a newer
     // one waits for the counter, as in KWin, and only the latest is sent.
     bool deferred = false;
     if (xSize != w.xGeometry.size()) {
+        if (w.awaitedSize != xSize) {
+            w.awaitedSize = xSize;
+            ++w.awaitRevision;
+        }
+        w.awaitedSynced = false;
         if (w.syncPending)
             deferred = w.syncDeferred = true;
         else
-            requestSync(w);
+            w.awaitedSynced = !requestSync(w);
     }
     if (!deferred) {
         w.sizeUnknown = false;
@@ -1667,9 +1806,7 @@ void Xwm::event(xcb_generic_event_t *generic)
         for (auto &[id, w] : m_windows) {
             if (w->syncAlarm != e->alarm)
                 continue;
-            w->syncPending = false;
-            if (std::exchange(w->syncDeferred, false))
-                synchronize(*w);
+            syncReached(*w);
             break;
         }
         return;
@@ -1867,9 +2004,7 @@ void Xwm::event(xcb_generic_event_t *generic)
     } else if (type == XCB_CONFIGURE_REQUEST) {
         auto *e = reinterpret_cast<xcb_configure_request_event_t *>(generic);
         // The request in X11 pixels, then in logical units.
-        base::Rect xRect = w.window ? base::Rect(toX(w.window->contentBounds().topLeft()),
-                                                 sizeToX(w.window->contentBounds().size()))
-                                    : w.xGeometry;
+        base::Rect xRect = w.window ? bodyToX(w, w.window->contentBounds()) : w.xGeometry;
         // The event fills what the request leaves out from the server's geometry, which
         // can predate our answer to an earlier request; it only replaces an unknown size.
         if (!w.window && std::exchange(w.sizeUnknown, false))
@@ -1882,7 +2017,9 @@ void Xwm::event(xcb_generic_event_t *generic)
             xRect.setWidth(std::max<int>(1, e->width));
         if (e->value_mask & XCB_CONFIG_WINDOW_HEIGHT)
             xRect.setHeight(std::max<int>(1, e->height));
-        const base::Rect rect(fromX(xRect.topLeft()), sizeFromX(xRect.size()));
+        const base::Rect rect = w.window
+                ? bodyFromX(w, xRect)
+                : base::Rect(fromX(xRect.topLeft()), sizeFromX(xRect.size()));
         if (w.window) {
             auto insets = w.window->frameInsets();
             w.window->requestBounds(base::Rect(rect.topLeft() - base::Point(insets.left, insets.top),

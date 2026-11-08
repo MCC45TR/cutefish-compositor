@@ -639,6 +639,17 @@ TEST_F(XwaylandTest, ScaledX11ClientsDrawAtDeviceResolution)
     EXPECT_EQ(setting(xsettings(), "Gdk/WindowScalingFactor"), 2);
     EXPECT_EQ(setting(xsettings(), "Xft/DPI"), 192 * 1024);
 
+    // The cursor's logical size reaches X11 clients in X11 pixels.
+    xwayland->setCursorTheme("Adwaita", 24);
+    EXPECT_TRUE(until([&] {
+        const std::string value = resources();
+        return value.find("Xcursor.theme:\tAdwaita\n") != std::string::npos
+                && value.find("Xcursor.size:\t48\n") != std::string::npos;
+    }));
+    EXPECT_EQ(setting(xsettings(), "Gtk/CursorThemeSize"), 48);
+    EXPECT_NE(xsettings().find("Gtk/CursorThemeName"), std::string::npos);
+    EXPECT_NE(xsettings().find("Adwaita"), std::string::npos);
+
     const auto id = xcb_generate_id(c);
     const uint32_t values[] = {screen->white_pixel, XCB_EVENT_MASK_BUTTON_PRESS};
     xcb_create_window(c, XCB_COPY_FROM_PARENT, id, screen->root, 0, 0, 600, 400, 0,
@@ -967,6 +978,69 @@ TEST_F(XwaylandTest, RemovingMaximizedStateLeavesAnUnmaximizedWindowAlone)
     }));
 }
 
+TEST_F(XwaylandTest, GtkFrameExtentsLeaveTheClientShadowOutOfTheWindow)
+{
+    ASSERT_TRUE(start()) << xwayland->error();
+    setenv("XAUTHORITY", xwayland->authority().c_str(), 1);
+    auto *c = xcbReply([&] {
+        return xcb_connect(xwayland->display().c_str(), nullptr);
+    });
+    ASSERT_EQ(xcb_connection_has_error(c), 0);
+    base::ScopeGuard cleanup([&] {
+        xcb_disconnect(c);
+    });
+    auto *screen = xcb_setup_roots_iterator(xcb_get_setup(c)).data;
+    const auto id = xcb_generate_id(c);
+    const uint32_t values[] = {screen->white_pixel};
+    xcb_create_window(c, XCB_COPY_FROM_PARENT, id, screen->root, 0, 0, 340, 240, 0,
+                      XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, XCB_CW_BACK_PIXEL,
+                      values);
+    const xcb_atom_t motif = intern(c, "_MOTIF_WM_HINTS");
+    const uint32_t undecorated[] = {2, 0, 0, 0, 0};
+    xcb_change_property(c, XCB_PROP_MODE_REPLACE, id, motif, motif, 32, 5, undecorated);
+    // Left, right, top, bottom.
+    const xcb_atom_t frameExtents = intern(c, "_GTK_FRAME_EXTENTS");
+    const uint32_t extents[] = {20, 20, 10, 30};
+    xcb_change_property(c, XCB_PROP_MODE_REPLACE, id, frameExtents, XCB_ATOM_CARDINAL, 32, 4,
+                        extents);
+    xcb_map_window(c, id);
+    xcb_flush(c);
+    ASSERT_TRUE(until([&] {
+        return manager->windows().size() == 1;
+    }));
+    auto *window = manager->windows()[0];
+    EXPECT_FALSE(window->isDecorated());
+    EXPECT_EQ(window->clientExteriorInsets(), (wm::Insets {20, 10, 20, 30}));
+    EXPECT_EQ(window->contentBounds().size(), base::Size(300, 200));
+    EXPECT_EQ(window->surfaceOrigin(), base::Point(-20, -10));
+
+    auto geometryMatches = [&](const base::Rect &expected) {
+        return until([&] {
+            auto *geometry = xcbReply([&] {
+                return xcb_get_geometry_reply(c, xcb_get_geometry(c, id), nullptr);
+            });
+            if (!geometry)
+                return false;
+            const bool matches = base::Rect(geometry->x, geometry->y, geometry->width,
+                                            geometry->height)
+                    == expected;
+            free(geometry);
+            return matches;
+        });
+    };
+    window->requestBounds(base::Rect(100, 120, 400, 300));
+    EXPECT_TRUE(geometryMatches(base::Rect(80, 110, 440, 340)));
+
+    xcb_delete_property(c, id, frameExtents);
+    xcb_flush(c);
+    EXPECT_TRUE(until([&] {
+        return window->clientExteriorInsets().isNull();
+    }));
+    EXPECT_EQ(window->contentBounds(), base::Rect(100, 120, 400, 300));
+    EXPECT_EQ(window->surfaceOrigin(), base::Point());
+    EXPECT_TRUE(geometryMatches(base::Rect(100, 120, 400, 300)));
+}
+
 TEST_F(XwaylandTest, NetWmWindowOpacityFadesTheWholeWindow)
 {
     ASSERT_TRUE(start()) << xwayland->error();
@@ -1274,6 +1348,28 @@ TEST_F(XwaylandTest, NetWmSyncRequestHoldsResizesForTheClientCounter)
     ASSERT_TRUE(until([&] {
         poll();
         return configures.back() == base::Size(300, 150);
+    }));
+
+    // A maximize cross-fades from the old picture until the client has
+    // painted at the new size: past its counter, then committed.
+    auto *animation = dynamic_cast<scene::WindowAnimation *>(window->node());
+    ASSERT_TRUE(animation);
+    xcb_sync_set_counter(c, counter, {0, requests.back()});
+    xcb_flush(c);
+    settle(100);
+    const size_t answered = requests.size();
+    window->maximize();
+    ASSERT_TRUE(animation->isRunning());
+    ASSERT_TRUE(scene::WindowAnimation::isCrossFade(animation->type()));
+    settle(200);
+    ASSERT_EQ(requests.size(), answered + 1);
+    EXPECT_TRUE(animation->isWaitingForBoundsContent());
+    xcb_sync_set_counter(c, counter, {0, requests.back()});
+    xcb_clear_area(c, 1, id, 0, 0, 0, 0);
+    xcb_flush(c);
+    EXPECT_TRUE(until([&] {
+        poll();
+        return !animation->isWaitingForBoundsContent();
     }));
 }
 
@@ -2662,7 +2758,8 @@ struct XdndPeer {
 };
 
 // A mapped native Wayland surface for the other end of a drag.
-compositor::Surface *mapNativeSurface(clipboard_test::Client &native, const base::Point &position)
+compositor::Surface *mapNativeSurface(clipboard_test::Client &native, scene::Node *container,
+                                      const base::Point &position)
 {
     auto *resource = wl_client_get_object(
             native.serverClient, wl_proxy_get_id(reinterpret_cast<wl_proxy *>(native.surface)));
@@ -2674,6 +2771,7 @@ compositor::Surface *mapNativeSurface(clipboard_test::Client &native, const base
                                        nullptr),
                     {});
     surface->commit();
+    surface->reparentNode(container);
     surface->setPosition(position);
     return surface;
 }
@@ -2690,7 +2788,7 @@ TEST_F(XwaylandTest, WaylandDragDropsOnAnX11Window)
     native.initialize();
     ASSERT_TRUE(until([&] {
         native.pump();
-        return mapNativeSurface(native, {500, 0});
+        return mapNativeSurface(native, compositor->surfaceContainer(), {500, 0});
     }));
     setenv("XAUTHORITY", xwayland->authority().c_str(), 1);
     XdndPeer x;
@@ -2787,7 +2885,7 @@ TEST_F(XwaylandTest, X11DragDropsOnAWaylandSurface)
     native.initialize();
     ASSERT_TRUE(until([&] {
         native.pump();
-        return mapNativeSurface(native, {500, 0});
+        return mapNativeSurface(native, compositor->surfaceContainer(), {500, 0});
     }));
     setenv("XAUTHORITY", xwayland->authority().c_str(), 1);
     XdndPeer x;
@@ -2905,7 +3003,7 @@ TEST_F(XwaylandTest, X11DragWithATypeListCanLeaveAndBeRefused)
     native.initialize();
     ASSERT_TRUE(until([&] {
         native.pump();
-        return mapNativeSurface(native, {500, 0});
+        return mapNativeSurface(native, compositor->surfaceContainer(), {500, 0});
     }));
     setenv("XAUTHORITY", xwayland->authority().c_str(), 1);
     XdndPeer x;
@@ -3031,7 +3129,7 @@ TEST_F(XwaylandTest, WaylandDragFollowsXdndProxyAndCancelsWhenRefused)
     native.initialize();
     ASSERT_TRUE(until([&] {
         native.pump();
-        return mapNativeSurface(native, {500, 0});
+        return mapNativeSurface(native, compositor->surfaceContainer(), {500, 0});
     }));
     setenv("XAUTHORITY", xwayland->authority().c_str(), 1);
     XdndPeer x, proxyPeer;
