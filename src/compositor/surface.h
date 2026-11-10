@@ -151,10 +151,12 @@ public:
     void setOpacity(float opacity);
     // Read when the top panel slides over the window in the fullscreen
     // state; see set_fullscreen_bars.
+    bool hasFullscreenBars() const { return m_hasFullscreenBars; }
     int fullscreenBarsHeight() const { return m_fullscreenBarsHeight; }
     bool fullscreenBarsPush() const { return m_fullscreenBarsPush; }
     void setFullscreenBars(int height, bool push)
     {
+        m_hasFullscreenBars = true;
         m_fullscreenBarsHeight = height;
         m_fullscreenBarsPush = push;
     }
@@ -219,6 +221,18 @@ public:
 
     base::Rect subsurfaceBlurRect() const { return m_state.basicState.subsurfaceBlurRect; }
     int subsurfaceBlurRadius() const { return m_state.basicState.subsurfaceBlurRadius; }
+
+    // Surface-local; empty for the rounded rectangle.
+    void setSubsurfaceBlurShape(const ui::Path &shape) { m_pending.basicState.subsurfaceBlurShape = shape; }
+
+    // What that blur lays over the blurred subsurfaces: the fill fields of
+    // the parameters only.
+    void setSubsurfaceBlurFill(const render::GlassParams &fill) { m_pending.basicState.subsurfaceBlurFill = fill; }
+    const render::GlassParams &subsurfaceBlurFill() const { return m_state.basicState.subsurfaceBlurFill; }
+
+    // The committed shape clipped to the rectangle; empty when there is none
+    // or no rectangle.
+    ui::Path subsurfaceBlurShape() const;
 
     void setOpaqueRegion(const base::Region &region);
     void setInputRegion(const base::Region &region);
@@ -471,6 +485,8 @@ private:
         render::GlassParams glass;
         base::Rect subsurfaceBlurRect;
         int subsurfaceBlurRadius = 0;
+        ui::Path subsurfaceBlurShape;
+        render::GlassParams subsurfaceBlurFill;
         base::Region opaqueRegion;
         // Unset means "the whole surface accepts input", which is the default
         // and is not the same as an empty region.
@@ -562,6 +578,7 @@ private:
     bool m_alwaysOnTop = false;
     bool m_castsShadow = true;
     float m_opacity = 1;
+    bool m_hasFullscreenBars = false;
     int m_fullscreenBarsHeight = 0;
     bool m_fullscreenBarsPush = false;
     ResizeAnchor m_resizeAnchor = ResizeAnchor::TopLeft;
