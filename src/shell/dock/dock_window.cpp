@@ -12,6 +12,7 @@
 #include "base/i18n.h"
 #include "base/strings.h"
 #include "base/url.h"
+#include "compositor/menu_model.h"
 #include "core/main_loop.h"
 #include "input/drag.h"
 #include "input/seat.h"
@@ -44,12 +45,12 @@ namespace cutefish::shell {
 
 namespace {
 
-// The launcher's own D-Bus service, org.cutefish.Launcher.
-void callLauncher(base::dbus::Connection *bus, const char *method)
+// The launchpad's own D-Bus service, org.cutefish.Launchpad.
+void callLaunchpad(base::dbus::Connection *bus, const char *method)
 {
     if (!bus)
         return;
-    bus->send(bus->newMethodCall("org.cutefish.Launcher", "/Launcher", "org.cutefish.Launcher",
+    bus->send(bus->newMethodCall("org.cutefish.Launchpad", "/Launchpad", "org.cutefish.Launchpad",
                                  method));
 }
 
@@ -240,6 +241,7 @@ DockWindow::DockWindow(Shell *shell, std::unique_ptr<Dock> dock)
     , m_raiseTimer(core::mainLoop())
     , m_reorderTimer(core::mainLoop())
     , m_tooltipHide(core::mainLoop())
+    , m_dockMenuWait(core::mainLoop())
     , m_strutSettle(core::mainLoop())
 {
     m_window = std::make_unique<ShellWindow>(shell, wm::WindowRole::Dock);
@@ -269,6 +271,8 @@ DockWindow::DockWindow(Shell *shell, std::unique_ptr<Dock> dock)
     m_tooltipHide.setSingleShot(true);
     m_tooltipHide.setInterval(std::chrono::milliseconds(150));
     m_tooltipHide.onTimeout = [this] { hideTooltip(); };
+    m_dockMenuWait.setSingleShot(true);
+    m_dockMenuWait.setInterval(std::chrono::milliseconds(150));
     m_strutSettle.setSingleShot(true);
     m_strutSettle.setInterval(std::chrono::milliseconds(200));
     m_strutSettle.onTimeout = [this] { updateStrut(); };
@@ -311,13 +315,13 @@ DockWindow::DockWindow(Shell *shell, std::unique_ptr<Dock> dock)
 
     DockModel &applications = m_dock->applications();
     base::dbus::Connection *bus = m_shell->bus();
-    applications.hideLauncher = [bus] { callLauncher(bus, "hide"); };
-    applications.toggleLauncher = [bus] { callLauncher(bus, "toggle"); };
+    applications.hideLaunchpad = [bus] { callLaunchpad(bus, "hide"); };
+    applications.toggleLaunchpad = [bus] { callLaunchpad(bus, "toggle"); };
     applications.launched = [this](const std::string &id) {
         if (DockIcon *icon = applicationIcon(id))
             icon->bounce();
     };
-    m_dock->minimizedWindows().hideLauncher = [bus] { callLauncher(bus, "hide"); };
+    m_dock->minimizedWindows().hideLaunchpad = [bus] { callLaunchpad(bus, "hide"); };
     m_dock->primaryGeometry = [this] { return primaryGeometry(); };
 
     const auto changed = [this] {
@@ -597,8 +601,8 @@ void DockWindow::rebuild()
             icon->setKey(item.id);
         }
         icon->setDraggable(!item.fixed);
-        if (item.id == DockModel::kLauncherId)
-            icon->setIcon(shellDataFile("launcher.svg"), true);
+        if (item.id == DockModel::kLaunchpadId)
+            icon->setIcon(shellDataFile("launchpad.svg"), true);
         else if (item.missing)
             icon->setIcon(shellDataFile("application-missing.svg"));
         else
@@ -1384,7 +1388,7 @@ void DockWindow::iconClicked(DockIcon *icon, int button)
         break;
     case DockIcon::Kind::Trash:
         if (button == int(ui::MouseButton::Left)) {
-            callLauncher(m_shell->bus(), "hide");
+            callLaunchpad(m_shell->bus(), "hide");
             TrashMonitor::openTrash(m_shell->bus());
         }
         break;
@@ -1398,14 +1402,19 @@ void DockWindow::iconMenuRequested(DockIcon *icon)
     switch (icon->kind()) {
     case DockIcon::Kind::Application: {
         const std::string id = icon->key();
-        // The launcher has no menu.
-        if (id == DockModel::kLauncherId)
+        // The launchpad has no menu.
+        if (id == DockModel::kLaunchpadId)
             return;
         DockModel &model = m_dock->applications();
         const int row = model.indexOf(id);
         if (row < 0)
             return;
         const DockItem &item = model.at(row);
+        const std::shared_ptr<compositor::MenuModel> dockMenu = item.running ? model.dockMenu(id) : nullptr;
+        if (dockMenu && !std::exchange(m_dockMenuPrepared, false)) {
+            prepareDockMenu(id, dockMenu);
+            return;
+        }
         const auto windows = model.windows(id);
         for (const DockModel::WindowInfo &window : windows) {
             const size_t index = menu->addItem(window.title.empty() ? item.visibleName : window.title,
@@ -1415,6 +1424,8 @@ void DockWindow::iconMenuRequested(DockIcon *icon)
             menu->setItemMaximumWidth(index, 320);
         }
         if (!windows.empty())
+            menu->addSeparator();
+        if (dockMenu && addDockMenuEntries(*menu, dockMenu, 0))
             menu->addSeparator();
         // A missing bundle keeps its place until it is unpinned.
         if (item.pinnable() || (item.missing && item.isPinned)) {
@@ -1438,7 +1449,7 @@ void DockWindow::iconMenuRequested(DockIcon *icon)
     }
     case DockIcon::Kind::Trash: {
         menu->addItem(tr("Open"), [bus] {
-            callLauncher(bus, "hide");
+            callLaunchpad(bus, "hide");
             TrashMonitor::openTrash(bus);
         });
         const size_t empty = menu->addItem(tr("Empty Trash"), [bus] { TrashMonitor::emptyTrash(bus); });
@@ -1447,6 +1458,63 @@ void DockWindow::iconMenuRequested(DockIcon *icon)
     }
     }
     popupMenu(icon, std::move(menu));
+}
+
+void DockWindow::prepareDockMenu(const std::string &id, const std::shared_ptr<compositor::MenuModel> &dockMenu)
+{
+    auto show = [this, id] {
+        m_dockMenuWait.stop();
+        m_dockMenuUpdate = {};
+        if (DockIcon *icon = applicationIcon(id)) {
+            m_dockMenuPrepared = true;
+            iconMenuRequested(icon);
+        }
+    };
+    m_dockMenuUpdate = dockMenu->menuUpdated.connect([show](int32_t menuId) {
+        if (menuId == 0)
+            show();
+    });
+    m_dockMenuWait.onTimeout = show;
+    m_dockMenuWait.start();
+    dockMenu->prepare(0);
+}
+
+// The application's entries under `id` as rows, a submenu for each entry
+// that opens one; true when there were any.
+bool DockWindow::addDockMenuEntries(ui::Menu &menu, const std::shared_ptr<compositor::MenuModel> &model, int32_t id)
+{
+    const compositor::MenuItem *parent = model->item(id);
+    if (!parent)
+        return false;
+    bool any = false;
+    bool separatorPending = false;
+    for (int32_t child : parent->children) {
+        const compositor::MenuItem *entry = model->item(child);
+        if (!entry || !entry->visible)
+            continue;
+        if (entry->separator) {
+            separatorPending = any;
+            continue;
+        }
+        if (std::exchange(separatorPending, false))
+            menu.addSeparator();
+        const std::string label = compositor::plainMenuLabel(entry->label);
+        if (entry->hasSubmenu) {
+            ui::Menu *submenu = menu.addSubmenu(label);
+            addDockMenuEntries(*submenu, model, child);
+        } else {
+            std::weak_ptr<compositor::MenuModel> weak = model;
+            const size_t index = menu.addItem(label, [weak, child] {
+                if (std::shared_ptr<compositor::MenuModel> owner = weak.lock())
+                    owner->activate(child);
+            });
+            menu.setItemEnabled(index, entry->enabled);
+            if (entry->toggle != compositor::MenuItem::Toggle::None)
+                menu.setItemChecked(index, entry->toggleState == 1);
+        }
+        any = true;
+    }
+    return any;
 }
 
 void DockWindow::popupMenu(DockIcon *icon, std::unique_ptr<ui::Menu> menu)
@@ -1543,6 +1611,7 @@ void DockWindow::iconDragRequested(DockIcon *icon)
     source.iconScale = scale;
     const ui::RectF rect = icon->magnifiedIconRect();
     source.hotSpot = {rect.width / 2, rect.height / 2};
+    drag.iconHeight = rect.height;
     // A drag the compositor never ran ends here; one it ran, in onDragEnded().
     source.onFinished = [this, alive = m_alive](ui::DropAction) {
         if (*alive && m_drag && !m_drag->started)
@@ -1629,12 +1698,22 @@ void DockWindow::onDragMoved(const base::PointF &location)
     input::DragController *drag = m_shell->seat()->drag();
     drag->setIconOpacity(m_drag->removes ? 0.5f : 1.0f);
     drag->setReturnsHome(!m_drag->removes);
+    drag->setVanishesOnDrop(m_drag->removes);
+    if (m_drag->removes) {
+        const base::Rect window = m_window->geometry();
+        m_tooltip->showAbove(tr("Remove"), base::PointF(location.x() - window.x(),
+                                                        location.y() - m_drag->iconHeight / 2 - window.y()));
+    } else if (m_tooltip->isShown()) {
+        hideTooltip();
+    }
 }
 
 void DockWindow::onDragEnded()
 {
     input::DragController *drag = m_shell->seat()->drag();
     const bool own = m_drag && m_drag->started && !m_drag->returning;
+    if (own)
+        hideTooltip();
     if (own && drag->isReturning()) {
         // Nothing took it: the slot opens again under the icon on its way back.
         m_drag->removes = false;
@@ -1645,7 +1724,7 @@ void DockWindow::onDragEnded()
     } else if (own) {
         finishIconDrag();
     } else if (!m_drag && m_applications->isDragging()) {
-        // The launcher's drag ended without a drop on the dock.
+        // The launchpad's drag ended without a drop on the dock.
         m_applications->endDrag();
     }
     resetDropTarget();
@@ -1900,7 +1979,7 @@ void DockWindow::anchorApplicationArea()
 
 void DockWindow::enterApplicationArea()
 {
-    // What the drag carries must be known first; the launcher's is read.
+    // What the drag carries must be known first; the launchpad's is read.
     if ((m_drop.application && !m_drop.appId) || (m_drop.desktop && !m_drop.desktopId))
         return;
     const std::string appId = m_drop.appId.value_or(std::string());

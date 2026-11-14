@@ -992,6 +992,24 @@ TEST_F(DrmOutputTest, AnOutputWithoutVblankIsPacedAtSixtyHertz)
     EXPECT_NEAR(drm->refreshRate(), 75.0, 0.01);
 }
 
+// nvidia-drm counts no vblanks either, but stamps every flip when the display
+// took it and its mode is the panel's: 60 Hz would judder on a 155 Hz display.
+TEST_F(DrmOutputTest, AnOutputWithoutVblankKeepsItsModeRateWhenFlipTimesMarkTheRefresh)
+{
+    device.flipTimesMark = true;
+    auto &a = update();
+    ASSERT_TRUE(drm->enable());
+    flip(0, 0);
+    EXPECT_EQ(a.refresh, 13333333u);
+    auto &b = update();
+    drm->scheduleFrame();
+    ASSERT_TRUE(waitEvents(2));
+    flip(1, 0);
+    EXPECT_EQ(b.refresh, 13333333u);
+    EXPECT_NEAR(drm->pacingRate(), 75.0, 0.01);
+    EXPECT_NEAR(drm->refreshRate(), 75.0, 0.01);
+}
+
 // A frame drawn behind a flip that missed its vblank would land a refresh
 // late, and so would every frame begun before the queue drains.
 TEST_F(DrmOutputTest, NoFrameIsDrawnBehindALateFlip)

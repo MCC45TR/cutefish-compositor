@@ -137,7 +137,7 @@ private:
     std::set<uint32_t> m_pendingSerials;
 };
 
-// A main menu as the status bar sees it: the menu's items under the root,
+// A main menu as the menu bar sees it: the menu's items under the root,
 // their submenus under them. Windows keep it while they show the menu; it
 // clears them when the menu goes.
 class RootModel final : public compositor::MenuModel, public compositor::SurfaceObserver
@@ -179,6 +179,8 @@ public:
             surface->removeSurfaceObserver(this);
             if (surface->mainMenu().get() == this)
                 surface->setMainMenu(nullptr);
+            if (surface->dockMenu().get() == this)
+                surface->setDockMenu(nullptr);
         }
         m_surfaces.clear();
         menuUpdated(0);
@@ -645,8 +647,25 @@ void managerSetMainMenu(wl_client *, wl_resource *manager, wl_resource *surfaceR
     surface->setMainMenu(std::move(root));
 }
 
+void managerSetDockMenu(wl_client *, wl_resource *manager, wl_resource *surfaceResource, wl_resource *menuResource)
+{
+    compositor::Surface *surface = surfaceFromResource(surfaceResource);
+    if (!surface || !toplevelShellSurfaceForSurface(surfaceResource)) {
+        wl_resource_post_error(manager, CUTEFISH_MAIN_MENU_MANAGER_V1_ERROR_INVALID_SURFACE,
+                               "the surface is not a toplevel");
+        return;
+    }
+    if (!menuResource) {
+        surface->setDockMenu(nullptr);
+        return;
+    }
+    std::shared_ptr<RootModel> root = getUserDataAs<MenuObject>(menuResource)->rootModel();
+    root->addSurface(surface);
+    surface->setDockMenu(std::move(root));
+}
+
 const struct cutefish_main_menu_manager_v1_interface managerImplementation = {
-    managerDestroy, managerCreateMenu, managerCreateItem, managerSetMainMenu,
+    managerDestroy, managerCreateMenu, managerCreateItem, managerSetMainMenu, managerSetDockMenu,
 };
 
 void bindManager(wl_client *client, void *, uint32_t version, uint32_t id)

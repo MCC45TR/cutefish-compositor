@@ -1189,8 +1189,9 @@ bool Surface::updateTexture(render::Renderer &renderer)
                                           buffer->format(), damage);
     }
     if (!uploaded) {
-        std::unique_ptr<render::Texture> texture = renderer.createTexture(
-                buffer->size(), buffer->pixels(), buffer->stride(), buffer->format());
+        std::unique_ptr<render::Texture> texture = render::labelled(
+                renderer.createTexture(buffer->size(), buffer->pixels(), buffer->stride(), buffer->format()),
+                "surface");
         uploaded = texture != nullptr;
         m_node->setTexture(std::move(texture));
     }
@@ -1364,6 +1365,14 @@ void Surface::setMainMenu(std::shared_ptr<MenuModel> menu)
     if (menu == m_mainMenu)
         return;
     m_mainMenu = std::move(menu);
+    notifyMenuChanged();
+}
+
+void Surface::setDockMenu(std::shared_ptr<MenuModel> menu)
+{
+    if (menu == m_dockMenu)
+        return;
+    m_dockMenu = std::move(menu);
     notifyMenuChanged();
 }
 

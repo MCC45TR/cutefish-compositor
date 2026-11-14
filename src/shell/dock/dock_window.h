@@ -26,6 +26,10 @@
 #include "ui/geometry.h"
 #include "shell/shell.h"
 
+namespace cutefish::compositor {
+class MenuModel;
+}
+
 namespace cutefish::ui {
 class DropOffer;
 class Menu;
@@ -43,7 +47,7 @@ class ShellWindow;
 
 // The dock: a strip along the
 // primary output's edge, the panel centred in it on the compositor's glass,
-// with the launcher, the pinned and the running applications, a divider,
+// with the launchpad, the pinned and the running applications, a divider,
 // the minimized windows and the trash. The models and org.cutefish.Dock are
 // the Dock it is given; this is the view, its window and its input.
 class DockWindow : public Component
@@ -95,7 +99,7 @@ public:
     // drop targets too; a minimized window's id, for the dock alone.
     static constexpr const char *kApplicationMime = "application/x-cutefish-dock-app-id";
     static constexpr const char *kWindowMime = "application/x-cutefish-dock-window-id";
-    // What the launcher's drags carry: the desktop id.
+    // What the launchpad's drags carry: the desktop id.
     static constexpr const char *kDesktopMime = "application/x-cutefish-desktop-id";
 
     DockPresentation *applicationPresentation() const { return m_applications.get(); }
@@ -121,6 +125,8 @@ private:
         DockIcon::Kind kind;
         std::string key;
         uint64_t window = 0;
+        // Of the icon as dragged, held at its centre.
+        double iconHeight = 0;
         bool started = false;
         // A pinned icon held far enough off the dock: unpinned where let go.
         bool removes = false;
@@ -139,7 +145,7 @@ private:
         bool desktop = false;
         bool window = false;
         bool files = false;
-        // What the drag carries, once read; the launcher's arrives later.
+        // What the drag carries, once read; the launchpad's arrives later.
         std::optional<std::string> appId;
         std::optional<std::string> desktopId;
         ui::PointF position;
@@ -217,6 +223,8 @@ private:
     DockIcon *iconAt(const ui::PointF &position) const;
     void reorderMinimized();
     void retire(DockIcon *icon);
+    void prepareDockMenu(const std::string &id, const std::shared_ptr<compositor::MenuModel> &dockMenu);
+    static bool addDockMenuEntries(ui::Menu &menu, const std::shared_ptr<compositor::MenuModel> &model, int32_t id);
     void popupMenu(DockIcon *icon, std::unique_ptr<ui::Menu> menu);
 
     Shell *m_shell;
@@ -279,6 +287,11 @@ private:
     std::unique_ptr<ui::Menu> m_menu;
     DockIcon *m_menuIcon = nullptr;
     bool m_menuOpen = false;
+    // An application's own entries are brought up to date before its menu
+    // shows; the wait ends when they arrive or the time is up.
+    base::Timer m_dockMenuWait;
+    base::Subscription m_dockMenuUpdate;
+    bool m_dockMenuPrepared = false;
 
     // Minimized windows whose thumbnail shows now, for the window manager to
     // stop drawing them once that frame is composed.

@@ -10,13 +10,16 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "egl_test_util.h"
+#include "loop_test_util.h"
 #include "pixel_test_util.h"
 #include "render/gl_program.h"
+#include "render/gl_texture.h"
 #include "base/region.h"
 #include "base/strings.h"
 #include "ui/geometry_conversions.h"
@@ -59,6 +62,61 @@ protected:
     std::unique_ptr<EglRenderer> renderer;
     std::unique_ptr<EglRenderTarget> target;
 };
+
+// Textures named 0 delete nothing, so the list is checked without a GPU.
+TEST(GlTextureUsageTest, CountsTheLiveTexturesBySizeOwnerAndKind)
+{
+    const auto count = [](const GlTextureUsage &usage, const char *label) {
+        for (const auto &[entry, counted] : usage.byLabel) {
+            if (entry && !std::strcmp(entry, label))
+                return counted;
+        }
+        return GlTextureUsage::Count();
+    };
+    const GlTextureUsage before = GlTexture::usage();
+    auto icon = std::make_unique<GlTexture>(0, base::Size(64, 64));
+    icon->label = "icon";
+    // The same label from another copy of the literal counts with it.
+    static const char kIcon[] = "icon";
+    auto second = std::make_unique<GlTexture>(0, base::Size(32, 32));
+    second->label = kIcon;
+    auto picture = std::make_unique<GlTexture>(0, base::Size(2048, 1024));
+    picture->label = "picture";
+    picture->mipmapped = true;
+    auto client = std::make_unique<GlTexture>(0, base::Size(100, 100), PixelFormat::Rgba8888,
+                                              0x8D65 /* GL_TEXTURE_EXTERNAL_OES */);
+    auto unlabelled = std::make_unique<GlTexture>(0, base::Size(300, 300));
+
+    GlTextureUsage usage = GlTexture::usage();
+    const uint64_t pictureBytes = uint64_t(2048) * 1024 * 4 / 3 * 4;
+    EXPECT_EQ(before.owned.textures + 4, usage.owned.textures);
+    EXPECT_EQ(before.owned.bytes + 64 * 64 * 4 + 32 * 32 * 4 + pictureBytes + 300 * 300 * 4, usage.owned.bytes);
+    EXPECT_EQ(before.imported.textures + 1, usage.imported.textures);
+    EXPECT_EQ(before.imported.bytes + 100 * 100 * 4, usage.imported.bytes);
+    EXPECT_EQ(before.bySize[0].textures + 2, usage.bySize[0].textures);
+    EXPECT_EQ(before.bySize[2].textures + 1, usage.bySize[2].textures);
+    EXPECT_EQ(before.bySize[4].textures + 1, usage.bySize[4].textures);
+    EXPECT_EQ(count(before, "icon").textures + 2, count(usage, "icon").textures);
+    EXPECT_EQ(count(before, "picture").bytes + pictureBytes, count(usage, "picture").bytes);
+    ASSERT_FALSE(usage.large.empty());
+    EXPECT_TRUE(std::any_of(usage.large.begin(), usage.large.end(), [](const GlTextureUsage::Large &large) {
+        return large.size == base::Size(2048, 1024) && large.mipmapped && !std::strcmp(large.label, "picture");
+    }));
+
+    // Gone from the middle of the list, the rest still counts.
+    second.reset();
+    usage = GlTexture::usage();
+    EXPECT_EQ(before.owned.textures + 3, usage.owned.textures);
+    EXPECT_EQ(count(before, "icon").textures + 1, count(usage, "icon").textures);
+    icon.reset();
+    picture.reset();
+    client.reset();
+    unlabelled.reset();
+    usage = GlTexture::usage();
+    EXPECT_EQ(before.owned.textures, usage.owned.textures);
+    EXPECT_EQ(before.owned.bytes, usage.owned.bytes);
+    EXPECT_EQ(before.imported.textures, usage.imported.textures);
+}
 
 TEST(ProgramInitialization, CompileLinkFailureAndMoveOwnership)
 {
@@ -314,6 +372,207 @@ TEST_F(RenderInternals, CachedBackdropMasksAndScratchMatchAFreshDraw)
     for (const int shift : {0, 3, 0, 3, 0})
         EXPECT_EQ(frame(shift), shift ? moved : still) << shift;
     EXPECT_EQ(glGetError(), GL_NO_ERROR);
+}
+
+// Frames of blurs that keep their backdrops, as the scene draws them, then
+// none: what the screen no longer shows goes once frames have stopped.
+class BackdropRelease : public RenderInternals
+{
+protected:
+    void SetUp() override
+    {
+        RenderInternals::SetUp();
+        renderer->endFrame();
+        EglRendererTestAccess::setBackdropReleaseDelay(*renderer, std::chrono::milliseconds(20));
+        renderer->setOutputContext({"test", layout, layout.size(), 1, 0, 1});
+        output = makeTarget();
+        ASSERT_TRUE(output);
+        glass.enabled = true;
+    }
+
+    void TearDown() override
+    {
+        if (renderer && output)
+            renderer->releaseTarget(output.get());
+        output.reset();
+        RenderInternals::TearDown();
+    }
+
+    // An output large enough that blurs apart get textures of their own.
+    std::unique_ptr<EglRenderTarget> makeTarget()
+    {
+        const EGLint attributes[] = {EGL_WIDTH, layout.width(), EGL_HEIGHT, layout.height(), EGL_NONE};
+        const auto surface =
+                eglCreatePbufferSurface(renderer->eglDisplay(), renderer->eglConfig(), attributes);
+        if (surface == EGL_NO_SURFACE)
+            return nullptr;
+        return std::make_unique<EglRenderTarget>(renderer->eglDisplay(), surface, nullptr, layout.size());
+    }
+
+    struct Blur {
+        uint64_t owner = 0;
+        base::Rect lens;
+    };
+
+    // The pass `scope` holding `blurs`, over two colours.
+    void paint(uint64_t scope, const std::vector<Blur> &blurs)
+    {
+        std::vector<KeptBackdrop> fresh;
+        for (const Blur &blur : blurs) {
+            if (blur.owner)
+                fresh.push_back({blur.owner, {}});
+        }
+        const BackdropPass pass(*renderer, scope, fresh);
+        renderer->clear({0, 0, 0, 1});
+        renderer->fillRect({0, 0, 128, 256}, {1, 0, 0, 1});
+        for (const Blur &blur : blurs) {
+            ui::Path ellipse;
+            ellipse.addEllipse(ui::fromBase(base::RectF(blur.lens)));
+            renderer->drawBackgroundBlur(blur.lens, 0, layout, glass, ellipse, blur.owner);
+        }
+    }
+
+    void frame(EglRenderTarget *into, uint64_t scope, const std::vector<Blur> &blurs)
+    {
+        ASSERT_TRUE(renderer->beginFrame(into));
+        paint(scope, blurs);
+        renderer->endFrame();
+    }
+
+    // As frame(), and what it drew.
+    ui::Bitmap capturedFrame(EglRenderTarget *into, uint64_t scope, const std::vector<Blur> &blurs)
+    {
+        EXPECT_TRUE(renderer->beginFrame(into));
+        const ui::Bitmap image = renderer->captureFrame([&] { paint(scope, blurs); });
+        renderer->endFrame();
+        return image;
+    }
+
+    // Long enough for a release that does not come.
+    void idle() { test::runFor(std::chrono::milliseconds(80)); }
+
+    // Until a release leaves this much, for when one is due.
+    bool waitForHolding(size_t scratch, size_t masks)
+    {
+        return test::runUntil([&] { return holding().scratch == scratch && holding().masks == masks; });
+    }
+
+    BackdropFilter::Holding holding() const { return EglRendererTestAccess::backdropHolding(*renderer); }
+
+    const base::Rect layout {0, 0, 256, 256};
+    GlassParams glass;
+    std::unique_ptr<EglRenderTarget> output;
+};
+
+TEST_F(BackdropRelease, TexturesOfASurfaceThatWentAreReleasedOnceFramesStop)
+{
+    frame(output.get(), 1, {{7, {10, 10, 40, 24}}});
+    EXPECT_EQ(holding().scratch, 1u);
+    EXPECT_EQ(holding().masks, 1u);
+    EXPECT_FALSE(EglRendererTestAccess::backdropReleaseArmed(*renderer));
+    // Its pass is drawn without it: the surface is gone.
+    frame(output.get(), 1, {});
+    EXPECT_EQ(holding().kept, 0u);
+    EXPECT_TRUE(EglRendererTestAccess::backdropReleaseArmed(*renderer));
+    EXPECT_EQ(holding().scratch, 1u);
+    EXPECT_TRUE(waitForHolding(0, 0));
+    EXPECT_EQ(glGetError(), GL_NO_ERROR);
+}
+
+TEST_F(BackdropRelease, TexturesOfShownSurfacesStayThroughIdle)
+{
+    // Kept results are drawn again unchanged: no frame uses the textures, yet
+    // the surfaces are still shown.
+    frame(output.get(), 1, {{7, {10, 10, 40, 24}}});
+    for (int i = 0; i < 3; ++i)
+        frame(output.get(), 1, {{7, {10, 10, 40, 24}}});
+    idle();
+    EXPECT_EQ(holding().scratch, 1u);
+    EXPECT_EQ(holding().masks, 1u);
+    EXPECT_EQ(holding().kept, 1u);
+}
+
+TEST_F(BackdropRelease, ASetSharedWithAShownSurfaceStays)
+{
+    // Plain blurs of one size share a set.
+    glass.enabled = false;
+    frame(output.get(), 1, {{7, {10, 10, 40, 24}}, {8, {150, 180, 40, 24}}});
+    EXPECT_EQ(holding().scratch, 1u);
+    frame(output.get(), 1, {{8, {150, 180, 40, 24}}});
+    idle();
+    EXPECT_EQ(holding().scratch, 1u);
+    frame(output.get(), 1, {});
+    EXPECT_TRUE(waitForHolding(0, 0));
+}
+
+TEST_F(BackdropRelease, ABlurThatKeepsNothingAgesByFramesOnly)
+{
+    frame(output.get(), 1, {{0, {10, 10, 40, 24}}});
+    frame(output.get(), 1, {{7, {150, 180, 60, 40}}});
+    frame(output.get(), 1, {});
+    // The keyless blur's set and mask stay; the other surface's go.
+    EXPECT_TRUE(waitForHolding(1, 1));
+}
+
+TEST_F(BackdropRelease, AnOutputThatStillShowsItsSurfaceKeepsItsTextures)
+{
+    auto second = makeTarget();
+    ASSERT_TRUE(second);
+    frame(output.get(), 1, {{7, {10, 10, 40, 24}}});
+    frame(second.get(), 2, {{8, {150, 180, 60, 40}}});
+    EXPECT_EQ(holding().scratch, 2u);
+    frame(output.get(), 1, {});
+    EXPECT_TRUE(waitForHolding(1, 1));
+    EXPECT_EQ(holding().kept, 1u);
+    // The second output's blur draws from what it kept.
+    frame(second.get(), 2, {{8, {150, 180, 60, 40}}});
+    EXPECT_EQ(holding().scratch, 1u);
+    renderer->releaseTarget(second.get());
+}
+
+TEST_F(BackdropRelease, NothingGoesWhileFramesContinue)
+{
+    // A delay well apart from the frames' spacing, so a late frame does not
+    // read as idle.
+    EglRendererTestAccess::setBackdropReleaseDelay(*renderer, std::chrono::milliseconds(200));
+    frame(output.get(), 1, {{7, {10, 10, 40, 24}}});
+    frame(output.get(), 1, {});
+    // Frames past two delays, fewer than ageing by frames drops after.
+    for (int i = 0; i < 25; ++i) {
+        test::runFor(std::chrono::milliseconds(20));
+        frame(output.get(), 1, {});
+    }
+    EXPECT_EQ(holding().scratch, 1u);
+    EXPECT_EQ(holding().masks, 1u);
+    EXPECT_TRUE(waitForHolding(0, 0));
+}
+
+// Released between frames with nothing current, as the compositor's context
+// is then; the surface coming back draws as it first did.
+TEST_F(BackdropRelease, AReleaseOutsideAFrameLeavesTheNextDrawAsAFreshOne)
+{
+    const std::vector<Blur> blurs {{7, {10, 10, 40, 24}}, {8, {150, 180, 60, 40}}};
+    const ui::Bitmap fresh = capturedFrame(output.get(), 1, blurs);
+    ASSERT_FALSE(fresh.isNull());
+    frame(output.get(), 1, {});
+    ASSERT_TRUE(eglMakeCurrent(renderer->eglDisplay(), EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT));
+    EXPECT_TRUE(waitForHolding(0, 0));
+    EXPECT_EQ(eglGetCurrentContext(), EGL_NO_CONTEXT);
+    EXPECT_EQ(capturedFrame(output.get(), 1, blurs), fresh);
+    EXPECT_EQ(glGetError(), GL_NO_ERROR);
+}
+
+TEST_F(BackdropRelease, ARendererDestroyedWithTheReleasePendingLeavesNothingBehind)
+{
+    frame(output.get(), 1, {{7, {10, 10, 40, 24}}});
+    frame(output.get(), 1, {});
+    ASSERT_TRUE(EglRendererTestAccess::backdropReleaseArmed(*renderer));
+    renderer->releaseTarget(output.get());
+    output.reset();
+    renderer->releaseTarget(target.get());
+    target.reset();
+    renderer.reset();
+    idle();
 }
 
 TEST_F(RenderInternals, APartialPassRedrawsOnlyItsRectAndKeepsTheRest)

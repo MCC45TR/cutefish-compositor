@@ -4,10 +4,13 @@
 
 #include "core/compositor_shell.h"
 
+#include <malloc.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
+#include <cstdarg>
+#include <cstdio>
 #include <utility>
 
 #include <xkbcommon/xkbcommon.h>
@@ -49,6 +52,7 @@
 #include "input/key_translator.h"
 #include "ipc/display_config_service.h"
 #include "render/egl_renderer.h"
+#include "render/gl_texture.h"
 #include "render/renderer.h"
 #include "scene/desk_switch_node.h"
 #include "scene/overview_node.h"
@@ -63,21 +67,22 @@
 #include "shell/notresponding/not_responding_sheets.h"
 #include "shell/notification/notification_ui.h"
 #include "shell/notification/notifications.h"
-#include "shell/launcher/launcher.h"
-#include "shell/launcher/launcher_window.h"
-#include "shell/menubar/menu_bar_view.h"
+#include "shell/launchpad/launchpad.h"
+#include "shell/launchpad/launchpad_window.h"
+#include "shell/menubar/app_menus_view.h"
 #include "shell/osd/osd.h"
 #include "shell/screenshot/screen_capture.h"
 #include "shell/screenshot/screen_grabber.h"
 #include "shell/secrets/secret_prompts.h"
 #include "shell/shell.h"
 #include "shell/shell_window.h"
-#include "shell/statusbar/device_usage.h"
-#include "shell/statusbar/status_bar.h"
-#include "shell/statusbar/status_bar_window.h"
-#include "shell/statusbar/vpn_notifier.h"
+#include "shell/menubar/device_usage.h"
+#include "shell/menubar/menu_bar.h"
+#include "shell/menubar/menu_bar_window.h"
+#include "shell/menubar/vpn_notifier.h"
 #include "shell/wallpaper/wallpaper.h"
 #include "switcher/switcher_view.h"
+#include "toolkit/toolkit_host.h"
 #include "ui/event.h"
 #include "wayland/idle_inhibition.h"
 #include "wayland/input_method_launcher.h"
@@ -134,6 +139,65 @@ void callAppRuntime(const std::string &method, int64_t pid)
                                                      "org.cutefish.AppRuntime", method);
     message.append(uint32_t(pid));
     bus->send(message);
+}
+
+std::string formatted(const char *format, ...) __attribute__((format(printf, 1, 2)));
+
+std::string formatted(const char *format, ...)
+{
+    char line[256];
+    va_list arguments;
+    va_start(arguments, format);
+    std::vsnprintf(line, sizeof(line), format, arguments);
+    va_end(arguments);
+    return line;
+}
+
+double mib(uint64_t bytes)
+{
+    return double(bytes) / (1 << 20);
+}
+
+// What the compositor holds, for the debug service: the heap, the GL textures
+// by size and owner, what Skia keeps and the wallpaper decodes.
+std::vector<std::string> memoryStats(shell::Wallpaper *wallpaper)
+{
+    std::vector<std::string> lines;
+    const struct mallinfo2 heap = mallinfo2();
+    lines.push_back(formatted("heap: arena %.1f MiB, in use %.1f MiB, free %.1f MiB, mmapped %.1f MiB, "
+                              "releasable at the top %.1f MiB",
+                              mib(heap.arena), mib(heap.uordblks + heap.hblkhd), mib(heap.fordblks),
+                              mib(heap.hblkhd), mib(heap.keepcost)));
+    const render::GlTextureUsage textures = render::GlTexture::usage();
+    lines.push_back(formatted("gl textures in texels: %zu owned %.1f MiB, %zu imported %.1f MiB",
+                              textures.owned.textures, mib(textures.owned.bytes), textures.imported.textures,
+                              mib(textures.imported.bytes)));
+    static const char *const kClasses[] = {"under 64 KiB", "under 256 KiB", "under 1 MiB", "under 4 MiB",
+                                           "4 MiB or more"};
+    for (size_t i = 0; i < std::size(kClasses); ++i) {
+        lines.push_back(formatted("gl owned %s: %zu, %.1f MiB", kClasses[i], textures.bySize[i].textures,
+                                  mib(textures.bySize[i].bytes)));
+    }
+    auto byLabel = textures.byLabel;
+    std::sort(byLabel.begin(), byLabel.end(),
+              [](const auto &a, const auto &b) { return a.second.bytes > b.second.bytes; });
+    for (const auto &[label, count] : byLabel) {
+        lines.push_back(formatted("gl owned by %s: %zu, %.1f MiB", label ? label : "(unlabelled)", count.textures,
+                                  mib(count.bytes)));
+    }
+    for (const render::GlTextureUsage::Large &large : textures.large) {
+        lines.push_back(formatted("gl large: %dx%d%s %.1f MiB %s", large.size.width(), large.size.height(),
+                                  large.mipmapped ? " mipmapped" : "", mib(large.bytes),
+                                  large.label ? large.label : "(unlabelled)"));
+    }
+    const ui::EmbeddedGpu::CacheUsage skia = toolkit::gpuCacheUsage();
+    lines.push_back(formatted("skia: %d resources, %.1f MiB, purgeable %.1f MiB", skia.resources, mib(skia.bytes),
+                              mib(skia.purgeableBytes)));
+    if (wallpaper) {
+        const auto [images, bytes] = wallpaper->cache().memory();
+        lines.push_back(formatted("wallpaper decodes: %d, %.1f MiB", images, mib(bytes)));
+    }
+    return lines;
 }
 
 // Whether `node` puts anything on the output, walked as the damage tracker does.
@@ -591,6 +655,7 @@ bool CompositorShell::init()
             }
             return lines;
         });
+        m_windowDebugService->setMemoryStats([this] { return memoryStats(m_wallpaper); });
         if (!m_windowDebugService->registerService())
             CF_WARNING(cfWayland) << "The window debug service is unavailable";
     }
@@ -752,37 +817,37 @@ void CompositorShell::initShell()
     auto *notifications = m_shell->addComponent(std::make_unique<shell::NotificationUi>(
             m_shell.get(), std::make_unique<shell::Notifications>(environment.bus, m_shell->applications(),
                                                                   &m_shell->tasks())));
-    auto launcher = std::make_unique<shell::Launcher>(environment.bus, m_shell->tasks(), m_shell->launcher(),
-                                                      dockService, preferencesFile("shell"));
-    shell::Launcher *launcherService = launcher.get();
-    m_shell->addComponent(std::make_unique<shell::LauncherWindow>(m_shell.get(), std::move(launcher),
-                                                                  dockService, wallpaper));
-    // The dock and the accelerators reach the launcher directly.
-    dockService->applications().hideLauncher = [launcherService] { launcherService->hide(); };
-    dockService->applications().toggleLauncher = [launcherService] { launcherService->toggle(); };
-    dockService->minimizedWindows().hideLauncher = [launcherService] { launcherService->hide(); };
+    auto launchpad = std::make_unique<shell::Launchpad>(environment.bus, m_shell->tasks(), m_shell->launcher(),
+                                                        dockService, preferencesFile("shell"));
+    shell::Launchpad *launchpadService = launchpad.get();
+    m_shell->addComponent(std::make_unique<shell::LaunchpadWindow>(m_shell.get(), std::move(launchpad),
+                                                                   dockService, wallpaper));
+    // The dock and the accelerators reach the launchpad directly.
+    dockService->applications().hideLaunchpad = [launchpadService] { launchpadService->hide(); };
+    dockService->applications().toggleLaunchpad = [launchpadService] { launchpadService->toggle(); };
+    dockService->minimizedWindows().hideLaunchpad = [launchpadService] { launchpadService->hide(); };
     if (m_acceleratorDelegate)
-        m_acceleratorDelegate->launcherToggle = [launcherService] { launcherService->toggle(); };
-    auto statusBar = std::make_unique<shell::StatusBar>(
+        m_acceleratorDelegate->launchpadToggle = [launchpadService] { launchpadService->toggle(); };
+    auto menuBar = std::make_unique<shell::MenuBar>(
             environment.bus, environment.bus ? base::dbus::Connection::system(mainLoop()) : nullptr,
             &m_shell->tasks(), preferencesFile("shell"));
-    shell::StatusBar *statusBarService = statusBar.get();
+    shell::MenuBar *menuBarService = menuBar.get();
     auto *bar = m_shell->addComponent(
-            std::make_unique<shell::StatusBarWindow>(m_shell.get(), std::move(statusBar)));
+            std::make_unique<shell::MenuBarWindow>(m_shell.get(), std::move(menuBar)));
     bar->setWallpaper(wallpaper);
     if (m_computerControl) {
         bar->setAgentControl(m_computerControl->isActive());
         bar->onStopAgentControl = [this] { m_computerControl->stop(); };
-        m_statusBarAgentControl = m_computerControl->activeChanged.connect(
+        m_menuBarAgentControl = m_computerControl->activeChanged.connect(
                 [bar](bool active) { bar->setAgentControl(active); });
     }
-    bar->setMenuBar(std::make_unique<shell::MenuBarView>(m_shell.get(), bar->menuBarHost()));
+    bar->setAppMenus(std::make_unique<shell::AppMenusView>(m_shell.get(), bar->appMenusHost()));
     bar->setRecording(screenshot->isRecording());
     bar->onStopRecording = [screenshot] { screenshot->stopRecording(); };
     m_shellSubscriptions.push_back(screenshot->recordingChanged.connect(
             [bar, screenshot] { bar->setRecording(screenshot->isRecording()); }));
     auto *controlCenter = m_shell->addComponent(
-            shell::ControlCenter::create(m_shell.get(), bar->statusBar(), &notifications->notifications().settings()));
+            shell::ControlCenter::create(m_shell.get(), bar->menuBar(), &notifications->notifications().settings()));
     bar->addPanels(controlCenter);
     bar->setIndicators(controlCenter);
     m_shellSubscriptions.push_back(controlCenter->vpnFailed.connect(
@@ -807,8 +872,8 @@ void CompositorShell::initShell()
         screenshot->registerService();
         secrets->start();
         notifications->registerServices();
-        launcherService->registerService();
-        statusBarService->registerServices();
+        launchpadService->registerService();
+        menuBarService->registerServices();
     }
 }
 
@@ -1401,7 +1466,7 @@ CompositorShell::~CompositorShell()
     // With input stopped, so what the agent holds is left to the seat's teardown.
     m_computerControlPolicy.setController(nullptr);
     m_computerControlDrawn.reset();
-    m_statusBarAgentControl.reset();
+    m_menuBarAgentControl.reset();
     m_computerControl.reset();
     if (m_windowCycle)
         m_windowCycle->setView(nullptr);

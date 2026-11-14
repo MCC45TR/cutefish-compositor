@@ -12,7 +12,7 @@
 
 namespace cutefish::scene {
 
-// The status bar gradient's stops along a smoothstep, linear between them.
+// The menu bar gradient's stops along a smoothstep, linear between them.
 static double gradientStrength(double position)
 {
     static constexpr double kStops[] = {1.0, 0.896, 0.648, 0.352, 0.104, 0.0};
@@ -79,8 +79,10 @@ render::Texture *WallpaperNode::pictureTexture(render::Renderer &renderer) const
             && renderer.updateTexture(m_pictureTexture.get(), m_picture.constBits(), int(m_picture.stride()),
                                       render::PixelFormat::Bgrx8888);
     if (!reused) {
-        m_pictureTexture = renderer.createTexture(m_picture.size(), m_picture.constBits(), int(m_picture.stride()),
-                                                  render::PixelFormat::Bgrx8888);
+        m_pictureTexture = render::labelled(renderer.createTexture(m_picture.size(), m_picture.constBits(),
+                                                                   int(m_picture.stride()),
+                                                                   render::PixelFormat::Bgrx8888),
+                                            "wallpaper");
         m_pictureRenderer = m_pictureTexture ? &renderer : nullptr;
     }
     m_pictureStale = !m_pictureTexture;
@@ -107,7 +109,9 @@ render::Texture *WallpaperNode::gradientTexture(render::Renderer &renderer) cons
         texel[2] = uint8_t(std::lround(color.b * alpha));
         texel[3] = uint8_t(std::lround(255 * alpha));
     }
-    m_gradientTexture = renderer.createTexture(base::Size(1, rows), pixels.data(), 4, render::PixelFormat::Rgba8888);
+    m_gradientTexture = render::labelled(
+            renderer.createTexture(base::Size(1, rows), pixels.data(), 4, render::PixelFormat::Rgba8888),
+            "wallpaper gradient");
     m_gradientRenderer = m_gradientTexture ? &renderer : nullptr;
     m_gradientDrawn = m_gradient;
     m_gradientRows = rows;

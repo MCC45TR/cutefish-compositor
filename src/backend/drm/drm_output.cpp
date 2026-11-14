@@ -700,6 +700,8 @@ bool DrmOutput::fillModesetBuffer(render::EglRenderTarget *target, const base::S
         m_renderer->renderToTexture(m_carriedFrame, viewport, [&] {
             m_renderer->drawTexture(texture.get(), viewport, 1.0f);
         });
+        if (m_carriedFrame)
+            m_carriedFrame->label = "carried frame";
     }
     if (texture)
         m_renderer->drawTexture(texture.get(), viewport, 1.0f);
@@ -1181,8 +1183,10 @@ void DrmOutput::onPageFlip(uint64_t frame, uint32_t seconds, uint32_t microsecon
     // A driver without vblank (virtio-gpu) stamps every flip with sequence 0,
     // and its mode's refresh is made up: QEMU's EDID says 75 Hz. The frames
     // reach a host display running at its own rate, 60 or 120 Hz, where 75 fps
-    // cannot be paced evenly and 60 can.
-    if (!m_unsynced && sequence == 0 && m_lastSequence == 0 && m_completions > 0) {
+    // cannot be paced evenly and 60 can. A driver that stamps such flips when
+    // the display took them keeps its mode's refresh.
+    if (!m_unsynced && sequence == 0 && m_lastSequence == 0 && m_completions > 0
+        && !m_device->flipTimesMarkRefresh()) {
         m_unsynced = true;
         m_scheduler.setPeriod(framePeriod(pacingRate()));
         CF_INFO(cfDrm) << m_config.name << "has no vblank; pacing at" << pacingRate()

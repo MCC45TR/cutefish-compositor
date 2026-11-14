@@ -15,8 +15,8 @@ StackingLayer layerFor(WindowRole role, PanelBehavior behavior)
         return StackingLayer::Desktop;
     case WindowRole::Normal:
         return StackingLayer::Normal;
-    case WindowRole::Launcher:
-        return StackingLayer::Launcher;
+    case WindowRole::Launchpad:
+        return StackingLayer::Launchpad;
     case WindowRole::Panel:
         return behavior == PanelBehavior::WindowsCanCover ? StackingLayer::Normal
                                                           : StackingLayer::Panel;
@@ -48,6 +48,11 @@ StackingLayer layerFor(const Window *window)
         return parentLayer == StackingLayer::Desktop ? StackingLayer::DesktopPopup : parentLayer;
     }
     if (window->isAlwaysOnTop() && window->role() == WindowRole::Normal)
+        return StackingLayer::AlwaysOnTop;
+    // A dialog stays with the window it belongs to, as transient children
+    // share their parent's container in ash.
+    if (window->role() == WindowRole::Normal && window->transientParent()
+        && layerFor(window->transientParent()) == StackingLayer::AlwaysOnTop)
         return StackingLayer::AlwaysOnTop;
     return layerFor(window->role(), window->panelBehavior());
 }
