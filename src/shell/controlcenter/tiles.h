@@ -6,16 +6,18 @@
 #define CUTEFISH_SHELL_CONTROLCENTER_TILES_H_
 
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "base/timer.h"
 #include "shell/controlcenter/control_center_services.h"
+#include "ui/icon.h"
 #include "ui/view.h"
 
 namespace cutefish::ui {
-class Icon;
+class Animation;
 class ImageView;
 class Label;
 } // namespace cutefish::ui
@@ -38,9 +40,28 @@ private:
     std::optional<ui::Color> m_tint;
 };
 
+// The chevron of a tile with a detail page, in the secondary text colour:
+// shown while the tile is hovered, fading in and out over 150 ms.
+class DetailChevron : public ui::Icon
+{
+public:
+    static constexpr double kSize = 12;
+
+    DetailChevron();
+    ~DetailChevron() override;
+
+    void setShown(bool shown);
+
+private:
+    std::unique_ptr<ui::Animation> m_fade;
+    double m_from = 0;
+    double m_to = 0;
+};
+
 // A toggle tile: a round plate with the glyph, a
 // title and a status line. The whole card clicks; holding it 800 ms does the
-// press-and-hold action instead. No hover state, no animation.
+// press-and-hold action instead. A card with a detail page shows a chevron at
+// its end while hovered, and a click there opens the page.
 class CardItem : public ui::View
 {
 public:
@@ -59,9 +80,16 @@ public:
     bool isChecked() const { return m_checked; }
     void setTitle(std::string title);
     void setStatus(std::string status);
+    void setHasDetail(bool detail);
+    bool hasDetail() const { return m_hasDetail; }
+    // Where a click opens the detail page, in the card's coordinates: the
+    // chevron and the padding round it.
+    ui::RectF detailRect() const;
+    DetailChevron *chevron() const { return m_chevron; }
 
     std::function<void()> onClicked;
     std::function<void()> onPressAndHold;
+    std::function<void()> onDetail;
 
     ui::SizeF sizeHint() const override { return {0, kHeight}; }
     bool acceptsPointer() const override { return true; }
@@ -69,6 +97,7 @@ public:
 protected:
     void layout() override;
     void paint(ui::Painter &painter) override;
+    void hoverChanged() override;
     void pointerPress(const ui::PointerEvent &event) override;
     void pointerRelease(const ui::PointerEvent &event) override;
 
@@ -79,8 +108,11 @@ private:
     bool m_checked = false;
     bool m_pressed = false;
     bool m_held = false;
+    bool m_hasDetail = false;
+    bool m_detailPressed = false;
     SvgIcon *m_svg;
     ui::Icon *m_glyph;
+    DetailChevron *m_chevron;
     ui::Label *m_title;
     ui::Label *m_status;
     base::Timer m_holdTimer;

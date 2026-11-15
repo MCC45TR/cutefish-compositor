@@ -40,11 +40,8 @@ ui::Color tileColor();
 ui::Color tileInkColor();
 // PanelStyle.secondaryTextColor.
 ui::Color secondaryTextColor();
-// PanelStyle.panelTint over PanelGlass.
+// The menus' glass, which the control centre and the status panels share.
 render::GlassParams panelGlass();
-// The control centre's thinner glass: the wallpaper shows through, and the
-// tiles lifted off it carry the text.
-render::GlassParams controlCenterGlass();
 // StatusPanel's surfaceColor: the ink reference of the status panels.
 ui::Color statusSurfaceColor();
 // FishUI's Theme.textColor at `opacity`, as a Rectangle's opacity draws it.
@@ -66,6 +63,12 @@ ui::Color shade(ui::Color base, double amount);
 ui::RectF parityPlate(const ui::RectF &slot, double glyph, double scale);
 // TileBackground: a continuous-corner rect of the tile colour over a faint shadow.
 void paintTile(ui::Painter &painter, const ui::RectF &rect);
+
+// CSS's cubic-bezier(x1, y1, x2, y2) at time t.
+double cubicBezier(double x1, double y1, double x2, double y2, double t);
+// FrameTween's easing, cubic-bezier(0.25, 1, 0.5, 1): the panels' height
+// and the control centre's pages.
+double glide(double t);
 
 // The menu bar's images: `light/<name>.svg` (#383838 artwork) or
 // `dark/<name>.svg` (white), and the theme-less ones such as

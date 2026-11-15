@@ -35,6 +35,11 @@ static constexpr double kGlyphSize = 16;
 static constexpr double kRowSpacing = 12;
 static constexpr double kListSpacing = 2;
 static constexpr double kMinimumRowHeight = 36;
+// A row's badge sits this far inside its background.
+static constexpr double kBadgeInset = (kMinimumRowHeight - kBadgeSize) / 2;
+// The footer's line this far below the body's last ink, the link's capitals
+// as far below the line, and its baseline as far from the bottom edge.
+static constexpr double kFooterGap = 14;
 // FishUI's Font.DemiBold.
 static constexpr int kDemiBold = 600;
 static constexpr ui::Color kLightArtwork = ui::Color::rgb(0x383838);
@@ -42,6 +47,12 @@ static constexpr ui::Color kWhite = ui::Color::rgb(0xFFFFFF);
 // NetworkManager scans only now and then while connected; an open list asks
 // for more.
 static constexpr std::chrono::milliseconds kScanInterval {15000};
+
+// How far a label's line box reaches below its last baseline.
+static double descent(const ui::Label *label)
+{
+    return label->sizeHint().height - label->baselineOffset();
+}
 
 static double windowScale(const ui::View *view)
 {
@@ -52,28 +63,6 @@ static double windowScale(const ui::View *view)
 static bool insideRect(const ui::RectF &rect, const ui::PointF &point)
 {
     return point.x >= 0 && point.y >= 0 && point.x < rect.width && point.y < rect.height;
-}
-
-// CSS's cubic-bezier(x1, y1, x2, y2) at time t, FrameTween's easing.
-static double cubicBezier(double x1, double y1, double x2, double y2, double t)
-{
-    const auto sample = [](double a, double b, double s) {
-        return 3 * a * s * (1 - s) * (1 - s) + 3 * b * s * s * (1 - s) + s * s * s;
-    };
-    double low = 0;
-    double high = 1;
-    double s = t;
-    for (int i = 0; i < 40; ++i) {
-        const double x = sample(x1, x2, s);
-        if (std::abs(x - t) < 1e-7)
-            break;
-        if (x < t)
-            low = s;
-        else
-            high = s;
-        s = (low + high) / 2;
-    }
-    return sample(y1, y2, s);
 }
 
 // A row's background ink over the panel's surface.
@@ -99,6 +88,8 @@ PanelRow::PanelRow()
     m_busy->setVisible(false);
     m_lock = addChild<ui::Icon>("lock", kGlyphSize);
     m_lock->setVisible(false);
+    m_trailing = addChild<ui::Label>();
+    m_trailing->setVisible(false);
     setTracksHover(true);
 }
 
@@ -164,6 +155,15 @@ void PanelRow::setLocked(bool locked)
     requestLayout();
 }
 
+void PanelRow::setTrailingText(std::string text)
+{
+    if (text == m_trailing->text() && m_trailing->isVisible() == !text.empty())
+        return;
+    m_trailing->setVisible(!text.empty());
+    m_trailing->setText(std::move(text));
+    requestLayout();
+}
+
 void PanelRow::setRowEnabled(bool enabled)
 {
     if (enabled == m_rowEnabled)
@@ -196,6 +196,7 @@ void PanelRow::layout()
     m_artwork->setTint(white ? kWhite : kLightArtwork);
     m_lock->setColor(panel::secondaryTextColor());
     m_detail->setColor(panel::secondaryTextColor());
+    m_trailing->setColor(panel::secondaryTextColor());
 
     // The background reaches past the row's padding to kBackgroundMargin.
     const double inset = kRowMargin - kBackgroundMargin + kRowInset;
@@ -207,6 +208,11 @@ void PanelRow::layout()
     m_artwork->setGeometry(glyph);
 
     double right = geometry().width - inset;
+    if (m_trailing->isVisible()) {
+        const ui::SizeF size = m_trailing->sizeHint();
+        m_trailing->setGeometry({right - size.width, (height - size.height) / 2, size.width, size.height});
+        right -= size.width + kRowSpacing;
+    }
     if (m_lock->isVisible()) {
         m_lock->setGeometry({right - kGlyphSize, (height - kGlyphSize) / 2, kGlyphSize, kGlyphSize});
         right -= kGlyphSize + kRowSpacing;
@@ -267,15 +273,14 @@ void PanelRow::pointerRelease(const ui::PointerEvent &event)
         onClicked();
 }
 
-// The settings link: its text where the rows' text is, its background 6
-// above and below the text and out to kBackgroundMargin from the sides.
+// The settings link: its text where the rows' text is, its background
+// centred on the capitals and out to kBackgroundMargin from the sides.
 class StatusPanelView::SettingsLink final : public ui::View
 {
 public:
     explicit SettingsLink(std::string text)
     {
         m_label = addChild<ui::Label>(std::move(text));
-        m_label->setVerticallyCentered(true);
         setTracksHover(true);
     }
 
@@ -285,19 +290,21 @@ public:
         requestLayout();
     }
 
-    // The text's own height, at least 20.
-    double textHeight() const { return std::max(20.0, m_label->sizeHint().height); }
+    double capHeight() const { return m_label->capHeight(); }
+    // The label's top for a baseline at `baseline`, both in the link's parent.
+    double labelTop(double baseline, double scale) const { return alignedLabelTop(m_label, baseline, scale); }
+    void setLabelTop(double top)
+    {
+        m_labelTop = top;
+        placeLabel();
+    }
 
     std::function<void()> onClicked;
 
     bool acceptsPointer() const override { return true; }
 
 protected:
-    void layout() override
-    {
-        const double inset = kHorizontalPadding - kBackgroundMargin;
-        m_label->setGeometry({inset, kRowInset, geometry().width - 2 * inset, textHeight()});
-    }
+    void layout() override { placeLabel(); }
 
     void paint(ui::Painter &painter) override
     {
@@ -327,7 +334,14 @@ protected:
     }
 
 private:
+    void placeLabel()
+    {
+        const double inset = kHorizontalPadding - kBackgroundMargin;
+        m_label->setGeometry({inset, m_labelTop, geometry().width - 2 * inset, m_label->sizeHint().height});
+    }
+
     ui::Label *m_label;
+    double m_labelTop = 0;
     bool m_pressed = false;
 };
 
@@ -396,6 +410,11 @@ void StatusPanelView::setMaximumHeight(double height)
     contentChanged();
 }
 
+double StatusPanelView::panelWidth() const
+{
+    return geometry().width > 0 ? geometry().width : kWidth;
+}
+
 double StatusPanelView::headerHeight() const
 {
     // The capitals' top is as far from the edge as the text is from the side,
@@ -404,13 +423,21 @@ double StatusPanelView::headerHeight() const
     return textBaseline + kHorizontalPadding - kSectionSpacing;
 }
 
+double StatusPanelView::inkInset() const
+{
+    // Without a body the title's baseline is the last ink.
+    return m_bodyVisible ? bodyInkInset() : headerHeight() - (kHorizontalPadding - kContentPadding + m_title->capHeight());
+}
+
 double StatusPanelView::footerHeight() const
 {
-    // The separator 12 below the body and 12 above the link; the link
-    // kRowInset clear of the bottom for its background.
-    const double separator = kSectionSpacing + std::max(0.0, kSeparatorSpacing - kSectionSpacing) + 1
-            + std::max(0.0, kSeparatorSpacing - kSectionSpacing);
-    return separator + kSectionSpacing + m_link->textHeight() + kRowInset;
+    return kFooterGap - inkInset() + 1 + kFooterGap + m_link->capHeight() + kFooterGap - kBottomPadding;
+}
+
+double StatusPanelView::footerLineY() const
+{
+    // On whole device pixels, or the line spreads over two rows.
+    return snapToDevice(footerTop() - inkInset() + kFooterGap, windowScale(this));
 }
 
 double StatusPanelView::layoutHeight() const
@@ -478,7 +505,7 @@ void StatusPanelView::animateTo(double target)
         m_tween->setDuration(kHeightDuration);
         m_tween->setEasing(ui::Animation::Easing::Linear);
         m_tween->onUpdate = [this](double t) {
-            const double eased = cubicBezier(0.25, 1, 0.5, 1, t);
+            const double eased = panel::glide(t);
             setShownBottom(m_tweenFrom + (m_tweenTarget - m_tweenFrom) * eased);
         };
         m_tween->onFinished = [this] {
@@ -510,10 +537,10 @@ void StatusPanelView::layout()
     const double textBaseline = kHorizontalPadding - kContentPadding + m_title->capHeight();
     const double footer = footerTop();
     // Reveals and hides the body while the height animates.
-    m_clip->setGeometry({0, kContentPadding, kWidth, std::max(0.0, footer - kContentPadding)});
+    m_clip->setGeometry({0, kContentPadding, panelWidth(), std::max(0.0, footer - kContentPadding)});
 
     const double headerX = kHorizontalPadding;
-    double headerRight = kWidth - kHorizontalPadding;
+    double headerRight = panelWidth() - kHorizontalPadding;
     if (m_accessory) {
         const ui::SizeF size = m_accessory->sizeHint();
         // Centred on the capitals.
@@ -535,20 +562,24 @@ void StatusPanelView::layout()
 
     // The body stays drawn while the panel closes over it.
     m_body->setVisible(m_bodyVisible || m_reach > contentHeight());
-    m_body->setGeometry({0, 0, kWidth, std::max(0.0, m_maximumHeight)});
+    m_body->setGeometry({0, 0, panelWidth(), std::max(0.0, m_maximumHeight)});
     layoutBody(headerHeight() + kSectionSpacing);
 
-    const double linkTop = footer + kSeparatorSpacing + 1 + std::max(0.0, kSeparatorSpacing - kSectionSpacing)
-            + kSectionSpacing;
-    m_link->setGeometry({kBackgroundMargin, linkTop - kRowInset, kWidth - 2 * kBackgroundMargin,
-                         m_link->textHeight() + 2 * kRowInset});
+    const double baseline = footerLineY() + 1 + kFooterGap + m_link->capHeight();
+    // Its background kBackgroundMargin clear of the bottom edge, as far above
+    // the capitals' centre as below it.
+    const double capCenter = baseline - m_link->capHeight() / 2;
+    const double backgroundBottom = baseline + kFooterGap - kBackgroundMargin;
+    const double linkTop = snapToDevice(2 * capCenter - backgroundBottom, scale);
+    m_link->setGeometry({kBackgroundMargin, linkTop, panelWidth() - 2 * kBackgroundMargin, backgroundBottom - linkTop});
+    m_link->setLabelTop(m_link->labelTop(baseline, scale) - linkTop);
 }
 
 void StatusPanelView::paint(ui::Painter &painter)
 {
     // The separator above the settings link.
-    const double y = footerTop() + kSeparatorSpacing;
-    painter.fillRect({kHorizontalPadding, y, kWidth - 2 * kHorizontalPadding, 1}, panel::textColor(0.08));
+    painter.fillRect({kHorizontalPadding, footerLineY(), panelWidth() - 2 * kHorizontalPadding, 1},
+                     panel::textColor(0.08));
 }
 
 // A 1 px line of the text colour at 0.08, as the panels' separators.
@@ -558,9 +589,9 @@ protected:
     void paint(ui::Painter &painter) override { painter.fillRect(localRect(), panel::textColor(0.08)); }
 };
 
-// The networks, laid out in the scroll view edge to edge so its bar sits on
+// A panel's rows, laid out in a scroll view edge to edge so its bar sits on
 // the panel's edge.
-class NetworkPanel::List final : public ui::View
+class PanelRowList final : public ui::View
 {
 public:
     double heightForWidth(double) const override
@@ -606,7 +637,7 @@ NetworkPanel::NetworkPanel(ControlCenterServices &services)
     m_separator = body()->addChild<Separator>();
     m_scroll = body()->addChild<ui::ScrollView>();
     m_scroll->setScrollDirections(false, true);
-    m_list = m_scroll->setContent<List>();
+    m_list = m_scroll->setContent<PanelRowList>();
     m_hotspot = m_list->addChild<PanelRow>();
     m_hotspot->setGlyph("network-wireless-hotspot");
     m_hotspot->setActive(true);
@@ -701,12 +732,15 @@ double NetworkPanel::listHeight() const
 // the first row's badge as far below it. Fixed lengths, so the line keeps its
 // place while the list fills in.
 static constexpr double kHeaderLineGap = 14;
-// A row's badge sits this far inside its background.
-static constexpr double kBadgeInset = (kMinimumRowHeight - kBadgeSize) / 2;
 
 double NetworkPanel::listLead() const
 {
     return kHeaderLineGap - kHorizontalPadding + 1 + kHeaderLineGap - kBadgeInset;
+}
+
+double NetworkPanel::bodyInkInset() const
+{
+    return kBadgeInset;
 }
 
 double NetworkPanel::bodyHeight() const
@@ -725,11 +759,11 @@ void NetworkPanel::layoutBody(double top)
     const double baseline = top - kHorizontalPadding;
     // On whole device pixels, or the line spreads over two rows.
     const double lineY = snapToDevice(baseline + kHeaderLineGap, windowScale(this));
-    m_separator->setGeometry({kHorizontalPadding, lineY, kWidth - 2 * kHorizontalPadding, 1});
+    m_separator->setGeometry({kHorizontalPadding, lineY, panelWidth() - 2 * kHorizontalPadding, 1});
     // The list keeps its final height while the panel moves, so no scroll bar
     // shows on the way.
     const double height = std::min(listHeight(), std::max(0.0, bodyMaximumHeight() - listLead()));
-    m_scroll->setGeometry({0, top + listLead(), kWidth, height});
+    m_scroll->setGeometry({0, top + listLead(), panelWidth(), height});
 }
 
 VolumePanel::VolumePanel(ControlCenterServices &services)
@@ -803,6 +837,15 @@ void VolumePanel::refresh()
 static constexpr double kOutputLineAbove = 14;
 static constexpr double kOutputLineBelow = 10;
 
+double VolumePanel::bodyInkInset() const
+{
+    if (!m_outputs.empty())
+        return kBadgeInset;
+    if (m_slider->isVisible())
+        return 0;
+    return m_noOutput->isVisible() ? descent(m_noOutput) : 0;
+}
+
 double VolumePanel::bodyHeight() const
 {
     std::vector<double> heights;
@@ -827,7 +870,7 @@ double VolumePanel::bodyHeight() const
 void VolumePanel::layoutBody(double top)
 {
     const double x = kHorizontalPadding;
-    const double width = kWidth - 2 * kHorizontalPadding;
+    const double width = panelWidth() - 2 * kHorizontalPadding;
     double y = top;
     m_noOutput->setColor(panel::secondaryTextColor());
     m_heading->setColor(panel::secondaryTextColor());
@@ -850,9 +893,148 @@ void VolumePanel::layoutBody(double top)
     y += m_heading->sizeHint().height + kSectionSpacing;
     for (PanelRow *row : m_rows) {
         const double height = row->heightForWidth(kWidth);
-        row->setGeometry({kBackgroundMargin, y, kWidth - 2 * kBackgroundMargin, height});
+        row->setGeometry({kBackgroundMargin, y, panelWidth() - 2 * kBackgroundMargin, height});
         y += height + kListSpacing;
     }
+}
+
+// A device's 16 px theme icon, single-coloured as the badges' glyphs are.
+static std::string deviceArtwork(const std::string &icon)
+{
+    std::string path = icon.empty() ? std::string() : ui::themeIconPath(icon, int(kGlyphSize));
+    if (path.empty())
+        path = ui::themeIconPath("bluetooth", int(kGlyphSize));
+    return path;
+}
+
+// How long the switch shows the user's choice while BlueZ has not reported it.
+static constexpr std::chrono::milliseconds kRequestTimeout {5000};
+
+BluetoothPanel::BluetoothPanel(ControlCenterServices &services)
+    : StatusPanelView(tr("Bluetooth"), tr("Bluetooth Settings"), "bluetooth", services)
+{
+    m_switch = addChild<ui::Switch>();
+    m_switch->setPadding({0, 0, 0, 0});
+    m_switch->setLayoutHints({.preferredHeight = kHeaderHeight});
+    m_switch->onToggled = [this](bool checked) {
+        // The adapter powers on or off a moment later, and BlueZ reports
+        // other changes before that.
+        m_requested = checked;
+        m_requestTimer.start();
+        this->services().setBluetoothEnabled(checked);
+        refresh();
+    };
+    setAccessory(m_switch);
+
+    m_separator = body()->addChild<Separator>();
+    m_scroll = body()->addChild<ui::ScrollView>();
+    m_scroll->setScrollDirections(false, true);
+    m_list = m_scroll->setContent<PanelRowList>();
+
+    m_requestTimer.setSingleShot(true);
+    m_requestTimer.setInterval(kRequestTimeout);
+    m_requestTimer.onTimeout = [this] {
+        m_requested.reset();
+        refresh();
+    };
+    refresh();
+}
+
+BluetoothPanel::~BluetoothPanel() = default;
+
+void BluetoothPanel::retranslate()
+{
+    setTitles(tr("Bluetooth"), tr("Bluetooth Settings"));
+    refresh();
+}
+
+bool BluetoothPanel::shownEnabled() const
+{
+    return m_requested.value_or(services().bluetoothEnabled());
+}
+
+void BluetoothPanel::refresh()
+{
+    ControlCenterServices &services = this->services();
+    if (m_requested && *m_requested == services.bluetoothEnabled()) {
+        m_requested.reset();
+        m_requestTimer.stop();
+    }
+    m_switch->setChecked(shownEnabled());
+
+    std::vector<BluetoothDevice> devices = services.bluetoothDevices();
+    if (devices != m_devices) {
+        while (m_rows.size() > devices.size()) {
+            m_list->takeChild(m_rows.back());
+            m_rows.pop_back();
+        }
+        while (m_rows.size() < devices.size()) {
+            PanelRow *row = m_list->addChild<PanelRow>();
+            const size_t index = m_rows.size();
+            row->onClicked = [this, index] {
+                if (index < m_devices.size())
+                    this->services().setBluetoothDeviceConnected(m_devices[index].path, !m_devices[index].connected);
+            };
+            m_rows.push_back(row);
+        }
+        for (size_t i = 0; i < devices.size(); ++i) {
+            const BluetoothDevice &device = devices[i];
+            PanelRow *row = m_rows[i];
+            if (i >= m_devices.size() || device.icon != m_devices[i].icon)
+                row->setArtwork(deviceArtwork(device.icon));
+            row->setText(device.name);
+            // A connected device is marked by its accent badge alone.
+            row->setActive(device.connected);
+            row->setBold(device.connected);
+            row->setBusy(device.busy);
+            row->setRowEnabled(!device.busy);
+            row->setTrailingText(device.batteryPercentage >= 0 ? std::to_string(device.batteryPercentage) + "%"
+                                                               : std::string());
+        }
+        m_devices = std::move(devices);
+        m_list->requestLayout();
+    }
+    // The title's switch already shows that Bluetooth is off.
+    setBodyVisible(shownEnabled() && !m_devices.empty());
+    contentChanged();
+}
+
+double BluetoothPanel::listHeight() const
+{
+    return m_list->heightForWidth(kWidth);
+}
+
+// The line and the first row's badge as the Wi-Fi panel has them.
+double BluetoothPanel::listLead() const
+{
+    return kHeaderLineGap - kHorizontalPadding + 1 + kHeaderLineGap - kBadgeInset;
+}
+
+double BluetoothPanel::bodyInkInset() const
+{
+    return kBadgeInset;
+}
+
+double BluetoothPanel::bodyHeight() const
+{
+    if (m_devices.empty())
+        return 0;
+    return listLead() + std::min(listHeight(), std::max(0.0, bodyMaximumHeight() - listLead()));
+}
+
+void BluetoothPanel::layoutBody(double top)
+{
+    const bool listed = !m_devices.empty();
+    m_separator->setVisible(listed);
+    m_scroll->setVisible(listed);
+    const double baseline = top - kHorizontalPadding;
+    // On whole device pixels, or the line spreads over two rows.
+    const double lineY = snapToDevice(baseline + kHeaderLineGap, windowScale(this));
+    m_separator->setGeometry({kHorizontalPadding, lineY, panelWidth() - 2 * kHorizontalPadding, 1});
+    // The list keeps its final height while the panel moves, so no scroll bar
+    // shows on the way.
+    const double height = std::min(listHeight(), std::max(0.0, bodyMaximumHeight() - listLead()));
+    m_scroll->setGeometry({0, top + listLead(), panelWidth(), height});
 }
 
 static const char *const kProfiles[] = {"power-saver", "balanced", "performance"};
@@ -909,6 +1091,13 @@ void BatteryPanel::refresh()
     contentChanged();
 }
 
+double BatteryPanel::bodyInkInset() const
+{
+    if (!m_profiles.empty())
+        return kBadgeInset;
+    return descent(m_state->isVisible() ? m_state : m_source);
+}
+
 double BatteryPanel::bodyHeight() const
 {
     const double width = kWidth - 2 * kHorizontalPadding;
@@ -917,7 +1106,7 @@ double BatteryPanel::bodyHeight() const
         height += 3 + m_state->heightForWidth(width);
     if (m_profiles.empty())
         return height;
-    // The separator, spaced like the one above the settings link.
+    // The separator, kSeparatorSpacing clear of the text and the heading.
     const double margin = std::max(0.0, kSeparatorSpacing - kSectionSpacing);
     height += kSectionSpacing + margin + 1 + margin;
     height += kSectionSpacing + m_heading->sizeHint().height;
@@ -952,7 +1141,7 @@ void BatteryPanel::layoutBody(double top)
     }
     if (m_profiles.empty())
         return;
-    // Spaced like the separator above the settings link.
+    // kSeparatorSpacing clear of the text and the heading.
     const double margin = std::max(0.0, kSeparatorSpacing - kSectionSpacing);
     const double separator = snapToDevice(y + kSectionSpacing + margin, windowScale(this));
     m_separator->setGeometry({x, separator, width, 1});

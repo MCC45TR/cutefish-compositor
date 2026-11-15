@@ -40,19 +40,7 @@ ui::Color secondaryTextColor()
 
 render::GlassParams panelGlass()
 {
-    render::GlassParams glass = dark() ? popupGlass(0.13, 0.13, 0.14, 0.86)
-                                       : popupGlass(0.94, 0.94, 0.95, 0.86);
-    glass.blurSigma = glassFixed(20.0);
-    glass.saturation = glassFixed(2.4);
-    return glass;
-}
-
-render::GlassParams controlCenterGlass()
-{
-    render::GlassParams glass = dark() ? popupGlass(0.1, 0.1, 0.11, 0.82) : popupGlass(0.97, 0.97, 0.98, 0.65);
-    glass.blurSigma = glassFixed(20.0);
-    glass.saturation = glassFixed(1.2);
-    return glass;
+    return dark() ? popupGlass(0.17, 0.17, 0.19, 0.6) : popupGlass(1, 1, 1, 0.6);
 }
 
 ui::Color statusSurfaceColor()
@@ -128,6 +116,32 @@ std::string artwork(std::string_view name, bool white)
 std::string artwork(std::string_view name)
 {
     return shellDataFile(std::string("controlcenter/") + std::string(name) + ".svg");
+}
+
+double cubicBezier(double x1, double y1, double x2, double y2, double t)
+{
+    const auto sample = [](double a, double b, double s) {
+        return 3 * a * s * (1 - s) * (1 - s) + 3 * b * s * s * (1 - s) + s * s * s;
+    };
+    double low = 0;
+    double high = 1;
+    double s = t;
+    for (int i = 0; i < 40; ++i) {
+        const double x = sample(x1, x2, s);
+        if (std::abs(x - t) < 1e-7)
+            break;
+        if (x < t)
+            low = s;
+        else
+            high = s;
+        s = (low + high) / 2;
+    }
+    return sample(y1, y2, s);
+}
+
+double glide(double t)
+{
+    return cubicBezier(0.25, 1, 0.5, 1, t);
 }
 
 } // namespace cutefish::shell::panel
