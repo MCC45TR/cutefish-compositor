@@ -8,18 +8,20 @@
 #include <chrono>
 #include <cmath>
 #include <ctime>
+#include <optional>
+#include <utility>
 
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
 #include "base/dbus.h"
+#include "base/i18n.h"
 #include "base/locale.h"
 #include "core/main_loop.h"
 #include "cutefish/powerprofiles/power_profiles.h"
 #include "shell/shell_window.h"
 #include "shell/menubar/clock_format.h"
-#include "shell/menubar/menu_bar.h"
 #include "shell/menubar/device_usage.h"
 #include "shell/menubar/menu_bar_backdrop.h"
 #include "shell/menubar/status_icon.h"
@@ -28,15 +30,22 @@
 #include "shell/menubar/vpn_notifier.h"
 #include "ui/embedded_window.h"
 #include "ui/cell_layout.h"
+#include "ui/menu.h"
 #include "ui/path.h"
+#include "render/renderer.h"
 #include "ui/theme.h"
 #include "wm/status_items.h"
 #include "wm/window.h"
 #include "wm/window_manager.h"
 
+using cutefish::i18n::tr;
+
 namespace cutefish::shell {
 
 using Panel = MenuBarPanels::Panel;
+
+// Between the bar and a menu it opens, as the tray's.
+static constexpr double kMenuGap = 6;
 
 // The bar's row; a press between its items closes every popup.
 class MenuBarWindow::Root final : public ui::RowLayout
@@ -139,7 +148,10 @@ MenuBarWindow::MenuBarWindow(Shell *shell, std::unique_ptr<MenuBar> menuBar)
     m_statusItems->onWidthChanged = [this] { layoutRow(); };
 
     SystemTrayView::Host trayHost;
-    trayHost.closePanels = [this] { closePanels(); };
+    trayHost.closePanels = [this] {
+        closePanels();
+        closeControlMenu();
+    };
     trayHost.closeAppMenus = [this] {
         if (m_appMenus)
             m_appMenus->closeMenu();
@@ -157,19 +169,24 @@ MenuBarWindow::MenuBarWindow(Shell *shell, std::unique_ptr<MenuBar> menuBar)
     m_tray->setName("tray");
     m_tray->onCountChanged = [this] { layoutRow(); };
 
-    const auto statusIcon = [this](const char *name, Panel panel) {
+    const auto statusIcon = [this](const char *name, Panel panel, std::optional<MenuBar::Control> control) {
         StatusIcon *icon = m_root->addChild<StatusIcon>(this);
         icon->setName(name);
-        icon->onClicked = [this, panel](const ui::PointerEvent &) { togglePanel(panel); };
+        icon->onClicked = [this, icon, panel, control](const ui::PointerEvent &event) {
+            if (event.button == ui::MouseButton::Right && control)
+                toggleControlMenu(icon, *control);
+            else
+                togglePanel(panel);
+        };
         icon->onPreferredWidthChanged = [this] { layoutRow(); };
         return icon;
     };
-    m_volume = statusIcon("volume", Panel::Volume);
-    m_bluetooth = statusIcon("bluetooth", Panel::Bluetooth);
-    m_network = statusIcon("network", Panel::Network);
-    m_battery = statusIcon("battery", Panel::Battery);
+    m_volume = statusIcon("volume", Panel::Volume, MenuBar::Control::Sound);
+    m_bluetooth = statusIcon("bluetooth", Panel::Bluetooth, MenuBar::Control::Bluetooth);
+    m_network = statusIcon("network", Panel::Network, MenuBar::Control::WiFi);
+    m_battery = statusIcon("battery", Panel::Battery, MenuBar::Control::Battery);
     m_battery->setIconWidth(BarContext::kIconSize + 6);
-    m_control = statusIcon("control", Panel::ControlCenter);
+    m_control = statusIcon("control", Panel::ControlCenter, std::nullopt);
     m_control->setIconName("control");
     m_clock = m_root->addChild<ClockItem>(this);
     m_clock->onClicked = [this](const ui::PointerEvent &) { togglePanel(Panel::NotificationCenter); };
@@ -221,6 +238,10 @@ MenuBarWindow::MenuBarWindow(Shell *shell, std::unique_ptr<MenuBar> menuBar)
 
 MenuBarWindow::~MenuBarWindow()
 {
+    if (m_controlMenu) {
+        m_controlMenu->onClosed = nullptr;
+        m_controlMenu->close();
+    }
     m_subscriptions.clear();
     m_panelSubscriptions.clear();
     m_indicatorsChanged.reset();
@@ -283,8 +304,17 @@ bool MenuBarWindow::panelOpen() const
 void MenuBarWindow::updateLook()
 {
     // What is behind the bar decides; the system's dark mode while nothing
-    // has been judged.
-    const bool light = m_backdrop->isValid() ? m_backdrop->useLightForeground() : ui::Theme::current().darkMode;
+    // has been judged. Under Reduce Transparency the bar has a fill of its
+    // own, by mode, and its contents follow the mode.
+    const bool dark = ui::Theme::current().darkMode;
+    const bool opaque = render::opaqueBackdrop().has_value();
+    bool light = m_backdrop->isValid() ? m_backdrop->useLightForeground() : dark;
+    m_fill = {0, 0, 0, 0};
+    if (opaque) {
+        m_fill = dark ? ui::Color::rgb(0x202020) : ui::Color::rgb(0xDADADA);
+        light = dark;
+    }
+    m_window->window()->setBackgroundColor(m_fill);
     m_lightContents = light;
     if (m_appMenus)
         m_appMenus->barChanged();
@@ -544,9 +574,49 @@ void MenuBarWindow::closePanels()
         panels->closePanels();
 }
 
+void MenuBarWindow::toggleControlMenu(StatusIcon *icon, MenuBar::Control control)
+{
+    const bool wasOpen = m_controlMenu && m_controlMenu->isOpen() && m_controlMenuIcon == icon;
+    closePopups();
+    if (wasOpen)
+        return;
+
+    // The previous menu goes on the next loop turn: it may be closing.
+    if (m_controlMenu) {
+        m_controlMenu->onClosed = nullptr;
+        core::mainLoop()->post([menu = std::shared_ptr<ui::Menu>(std::move(m_controlMenu))] {});
+    }
+    m_controlMenu = std::make_unique<ui::Menu>();
+    ui::Menu &menu = *m_controlMenu;
+    if (control == MenuBar::Control::Battery) {
+        Battery &battery = m_menuBar->battery();
+        const size_t percentage = menu.addItem(tr("Show Percentage"),
+                                               [&battery] { battery.setShowPercentage(!battery.showPercentage()); });
+        menu.setItemChecked(percentage, battery.showPercentage());
+        menu.addSeparator();
+    }
+    menu.addItem(tr("Remove"), [menuBar = m_menuBar.get(), control] { menuBar->setControlShown(control, false); });
+    menu.onClosed = [this] {
+        if (StatusIcon *icon = std::exchange(m_controlMenuIcon, nullptr))
+            icon->setContextMenuPressed(false);
+    };
+
+    m_controlMenuIcon = icon;
+    icon->setContextMenuPressed(true);
+    menu.setAvailableGeometry(availableGeometry());
+    menu.popupAt(icon->window(), icon->mapToWindow({icon->leftInset(), icon->geometry().height + kMenuGap}));
+}
+
+void MenuBarWindow::closeControlMenu()
+{
+    if (m_controlMenu && m_controlMenu->isOpen())
+        m_controlMenu->close();
+}
+
 void MenuBarWindow::closePopups()
 {
     closePanels();
+    closeControlMenu();
     if (m_appMenus)
         m_appMenus->closeMenu();
     m_tray->closeMenu();
@@ -557,7 +627,10 @@ MenuBarAppMenusHost MenuBarWindow::appMenusHost()
     MenuBarAppMenusHost host;
     host.bar = this;
     host.menuBar = m_menuBar.get();
-    host.closePanels = [this] { closePanels(); };
+    host.closePanels = [this] {
+        closePanels();
+        closeControlMenu();
+    };
     host.closeTrayMenu = [this] { m_tray->closeMenu(); };
     host.availableGeometry = [this] { return availableGeometry(); };
     return host;

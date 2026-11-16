@@ -282,6 +282,14 @@ protected:
         click(point.x(), point.y());
     }
 
+    void clickPlate(const shell::CardItem *card)
+    {
+        const ui::RectF plate = card->plateRect();
+        const ui::PointF origin = card->mapToWindow({plate.x + plate.width / 2, plate.y + plate.height / 2});
+        const base::Rect popup = center->popupWindow(Panel::ControlCenter)->drawnBounds();
+        click(popup.x() + origin.x, popup.y() + origin.y);
+    }
+
     // The footer's gaps, in the panel's coordinates: the last row's badge to
     // the line, the line to the link's capitals, the link's baseline to the
     // panel's bottom edge.
@@ -343,7 +351,7 @@ TEST_F(ControlCenterTest, TheControlCentreHangsBelowTheBarWithThePanelGlass)
     EXPECT_FALSE(center->isOpen(Panel::ControlCenter));
 }
 
-TEST_F(ControlCenterTest, CardsToggleTheirServicesAndHoldingOpensSettings)
+TEST_F(ControlCenterTest, CardsToggleTheirServices)
 {
     center->openPanel(Panel::ControlCenter, bar.get(), item(178));
     frame();
@@ -353,10 +361,12 @@ TEST_F(ControlCenterTest, CardsToggleTheirServicesAndHoldingOpensSettings)
     EXPECT_TRUE(view->bluetoothCard()->isChecked());
     EXPECT_FALSE(view->doNotDisturbCard()->isChecked());
 
-    clickView(Panel::ControlCenter, view->bluetoothCard());
+    // A card with a detail page toggles from its plate only.
+    clickPlate(view->bluetoothCard());
     test::runFor(std::chrono::milliseconds(5));
     EXPECT_FALSE(services->bluetooth);
     EXPECT_FALSE(view->bluetoothCard()->isChecked());
+    EXPECT_FALSE(center->controlCenterPager()->isShowingDetail());
     clickView(Panel::ControlCenter, view->doNotDisturbCard());
     clickView(Panel::ControlCenter, view->cameraCard());
     clickView(Panel::ControlCenter, view->darkModeCard());
@@ -375,24 +385,9 @@ TEST_F(ControlCenterTest, CardsToggleTheirServicesAndHoldingOpensSettings)
     frame();
     EXPECT_FALSE(view->wirelessCard()->isVisible());
     EXPECT_EQ(before, center->popupWindow(Panel::ControlCenter)->drawnBounds().height());
-    services->hardware = true;
-    services->changed();
-    test::runFor(std::chrono::milliseconds(5));
-    frame();
-
-    // Held 800 ms: the control centre goes and Settings opens on Wi-Fi.
-    const base::PointF point = centre(Panel::ControlCenter, view->wirelessCard());
-    press(point.x(), point.y());
-    test::runFor(std::chrono::milliseconds(900));
-    release();
-    test::runFor(std::chrono::milliseconds(20));
-    ASSERT_EQ(1u, services->settings.size());
-    EXPECT_EQ((std::vector<std::string> {"-m", "wlan"}), services->settings.front());
-    EXPECT_FALSE(center->isOpen(Panel::ControlCenter));
-    EXPECT_TRUE(services->wireless);
 }
 
-TEST_F(ControlCenterTest, TheWifiBluetoothAndSoundChevronsOpenTheirPanelsAsDetailPages)
+TEST_F(ControlCenterTest, TheWifiBluetoothAndSoundTilesOpenTheirPanelsAsDetailPages)
 {
     using State = shell::WirelessNetwork::State;
     using Security = shell::WirelessNetwork::Security;
@@ -421,12 +416,10 @@ TEST_F(ControlCenterTest, TheWifiBluetoothAndSoundChevronsOpenTheirPanelsAsDetai
     EXPECT_DOUBLE_EQ(wireless->geometry().height / 2, chevron.y + chevron.height / 2);
     EXPECT_DOUBLE_EQ(12, wireless->geometry().width - chevron.x - chevron.width);
 
-    // A click on it pushes the Wi-Fi panel: the pages slide and the window's
-    // height glides to the panel's.
-    const ui::RectF detail = wireless->detailRect();
+    // A click off the plate pushes the Wi-Fi panel: the pages slide and the
+    // window's height glides to the panel's.
     const base::Rect popup = window->drawnBounds();
-    const ui::PointF origin = wireless->mapToWindow({detail.x + detail.width / 2, detail.height / 2});
-    click(popup.x() + origin.x, popup.y() + origin.y);
+    click(card.x(), card.y());
     test::runFor(std::chrono::milliseconds(5));
     EXPECT_TRUE(services->wireless);
     auto *panel = dynamic_cast<shell::NetworkPanel *>(pager->detailPage());
@@ -438,7 +431,11 @@ TEST_F(ControlCenterTest, TheWifiBluetoothAndSoundChevronsOpenTheirPanelsAsDetai
     EXPECT_LT(pager->progress(), 1);
     EXPECT_GT(panel->opacity(), 0);
     EXPECT_LT(view->opacity(), 1);
-    // The window follows the pages frame by frame.
+    // The window follows the pages frame by frame, narrowing to a status
+    // panel's width with its right edge kept.
+    EXPECT_LT(window->drawnBounds().width(), 360);
+    EXPECT_GT(window->drawnBounds().width(), 320);
+    EXPECT_EQ(1440 - 6, window->drawnBounds().right());
     EXPECT_GT(window->drawnBounds().height(), std::min(mainHeight, int(std::lround(panel->shownBottom()))));
     EXPECT_LT(window->drawnBounds().height(), std::max(mainHeight, int(std::lround(panel->shownBottom()))));
     frames(std::chrono::milliseconds(400));
@@ -447,11 +444,11 @@ TEST_F(ControlCenterTest, TheWifiBluetoothAndSoundChevronsOpenTheirPanelsAsDetai
     EXPECT_TRUE(panel->transform().isIdentity());
     const int detailHeight = int(std::lround(panel->shownBottom()));
     EXPECT_NE(mainHeight, detailHeight);
-    EXPECT_EQ(base::Rect(1440 - 360 - 6, 38, 360, detailHeight), window->drawnBounds());
-    EXPECT_EQ(base::Rect(0, 0, 360, detailHeight), window->surface()->backgroundBlurRect());
-    // The panel's rows span the control centre's width.
+    EXPECT_EQ(base::Rect(1440 - 320 - 6, 38, 320, detailHeight), window->drawnBounds());
+    EXPECT_EQ(base::Rect(0, 0, 320, detailHeight), window->surface()->backgroundBlurRect());
+    // The panel is as wide as it is from the menu bar.
     ASSERT_EQ(2u, panel->rows().size());
-    EXPECT_EQ(360 - 2 * 6, panel->rows()[0]->geometry().width);
+    EXPECT_EQ(320 - 2 * 6, panel->rows()[0]->geometry().width);
     expectFooterGaps(panel, panel->rows().back());
 
     // Escape goes back to the tiles, and again closes the control centre.
@@ -463,10 +460,10 @@ TEST_F(ControlCenterTest, TheWifiBluetoothAndSoundChevronsOpenTheirPanelsAsDetai
     EXPECT_EQ(nullptr, pager->detailPage());
     EXPECT_TRUE(view->isVisible());
     EXPECT_EQ(1, view->opacity());
-    EXPECT_EQ(mainHeight, window->drawnBounds().height());
+    EXPECT_EQ(base::Rect(1440 - 360 - 6, 38, 360, mainHeight), window->drawnBounds());
 
     // The Sound slider's chevron sits at its title row's end, centred on the
-    // title's capitals, and opens the sound panel.
+    // title's capitals; a click anywhere off the slider opens the sound panel.
     shell::TileSlider *sound = view->soundSlider();
     EXPECT_TRUE(sound->hasDetail());
     EXPECT_FALSE(view->brightnessSlider()->hasDetail());
@@ -480,14 +477,13 @@ TEST_F(ControlCenterTest, TheWifiBluetoothAndSoundChevronsOpenTheirPanelsAsDetai
     EXPECT_NEAR(capCentre, soundChevron.y + soundChevron.height / 2, 0.5);
     EXPECT_DOUBLE_EQ(12, sound->geometry().width - soundChevron.x - soundChevron.width);
     EXPECT_LE(soundChevron.y + soundChevron.height, sound->slider()->geometry().y);
-    const ui::RectF soundDetail = sound->detailRect();
-    const ui::PointF soundOrigin = sound->mapToWindow({soundDetail.x + soundDetail.width / 2, soundDetail.height / 2});
+    const ui::PointF soundOrigin = sound->mapToWindow({soundTitle->geometry().x + 4, soundTitle->geometry().y + 4});
     click(popup.x() + soundOrigin.x, popup.y() + soundOrigin.y);
     frames(std::chrono::milliseconds(400));
     auto *volume = dynamic_cast<shell::VolumePanel *>(pager->detailPage());
     ASSERT_NE(nullptr, volume);
     ASSERT_EQ(2u, volume->rows().size());
-    EXPECT_EQ(360 - 2 * 6, volume->rows()[0]->geometry().width);
+    EXPECT_EQ(320 - 2 * 6, volume->rows()[0]->geometry().width);
     EXPECT_EQ(int(std::lround(volume->shownBottom())), window->drawnBounds().height());
     key(KEY_ESC);
     frames(std::chrono::milliseconds(420));
@@ -497,10 +493,7 @@ TEST_F(ControlCenterTest, TheWifiBluetoothAndSoundChevronsOpenTheirPanelsAsDetai
     // The Bluetooth chevron; the panel's settings link closes the control centre.
     services->devices = {{"/dev/a", "AirPods", "audio-headphones", true, false, 72}};
     shell::CardItem *bluetooth = view->bluetoothCard();
-    const ui::RectF bluetoothDetail = bluetooth->detailRect();
-    const ui::PointF bluetoothOrigin
-            = bluetooth->mapToWindow({bluetoothDetail.x + bluetoothDetail.width / 2, bluetoothDetail.height / 2});
-    click(popup.x() + bluetoothOrigin.x, popup.y() + bluetoothOrigin.y);
+    clickView(Panel::ControlCenter, bluetooth);
     frames(std::chrono::milliseconds(400));
     EXPECT_TRUE(services->bluetooth);
     auto *devices = dynamic_cast<shell::BluetoothPanel *>(pager->detailPage());

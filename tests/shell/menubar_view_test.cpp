@@ -26,6 +26,7 @@
 #include "loop_test_util.h"
 #include "scene/node.h"
 #include "scene/scene.h"
+#include "render/renderer.h"
 #include "shell/shell.h"
 #include "shell/shell_data.h"
 #include "shell/shell_window.h"
@@ -47,6 +48,7 @@
 #include "ui/bitmap.h"
 #include "ui/embedded_window.h"
 #include "ui/menu.h"
+#include "ui/theme.h"
 #include "wm/status_items.h"
 #include "wm/window.h"
 #include "wm/window_manager.h"
@@ -165,6 +167,13 @@ protected:
     void move(double x, double y)
     {
         input.onPointerMotionAbsolute(at(time += 20), {x, y});
+        frame();
+    }
+
+    void key(uint32_t code)
+    {
+        input.onKey(at(time += 20), code, true);
+        input.onKey(at(time += 20), code, false);
         frame();
     }
 
@@ -336,6 +345,62 @@ TEST_F(MenuBarViewTest, IndicatorsPickTheIcons)
     bar->setIndicators(nullptr);
 }
 
+TEST_F(MenuBarViewTest, ARightClickOnAControlOffersToRemoveIt)
+{
+    FakePanels panels;
+    bar->addPanels(&panels);
+    FakeIndicators indicators;
+    indicators.m_audio = {true, false, 0.5};
+    indicators.m_network = {true, true, false, "", ""};
+    bar->setIndicators(&indicators);
+    frame();
+    ASSERT_TRUE(bar->networkIcon()->isVisible());
+
+    // The menu opens under the plate, and no panel does.
+    const ui::RectF network = onScreen(bar->networkIcon());
+    click(network.x + network.width / 2, 16, BTN_RIGHT);
+    ASSERT_NE(nullptr, bar->controlMenu());
+    EXPECT_TRUE(bar->controlMenu()->isOpen());
+    EXPECT_TRUE(bar->networkIcon()->isPlateShown());
+    EXPECT_FALSE(bar->panelOpen());
+    EXPECT_TRUE(panels.opened.empty());
+
+    // A right click again closes it.
+    click(network.x + network.width / 2, 16, BTN_RIGHT);
+    EXPECT_FALSE(bar->controlMenu()->isOpen());
+    EXPECT_FALSE(bar->networkIcon()->isPlateShown());
+
+    // Its one row takes the control off the bar.
+    click(network.x + network.width / 2, 16, BTN_RIGHT);
+    ASSERT_TRUE(bar->controlMenu()->isOpen());
+    key(KEY_DOWN);
+    key(KEY_ENTER);
+    EXPECT_FALSE(bar->controlMenu()->isOpen());
+    EXPECT_FALSE(bar->menuBar().isControlShown(shell::MenuBar::Control::WiFi));
+    EXPECT_FALSE(bar->networkIcon()->isVisible());
+
+    // The battery's first row turns its percentage on and off.
+    ASSERT_FALSE(bar->menuBar().battery().showPercentage());
+    bar->batteryIcon()->setVisible(true);
+    frame();
+    const ui::RectF battery = onScreen(bar->batteryIcon());
+    click(battery.x + battery.width / 2, 16, BTN_RIGHT);
+    ASSERT_TRUE(bar->controlMenu()->isOpen());
+    key(KEY_DOWN);
+    key(KEY_ENTER);
+    EXPECT_TRUE(bar->menuBar().battery().showPercentage());
+    EXPECT_TRUE(bar->menuBar().isControlShown(shell::MenuBar::Control::Battery));
+
+    // The control centre's icon has no such menu.
+    const ui::RectF control = onScreen(bar->controlIcon());
+    click(control.x + 20, 16, BTN_RIGHT);
+    EXPECT_FALSE(bar->controlMenu()->isOpen());
+    EXPECT_EQ(std::vector<Panel> {Panel::ControlCenter}, panels.opened);
+
+    bar->setIndicators(nullptr);
+    bar->removePanels(&panels);
+}
+
 TEST_F(MenuBarViewTest, AnIconTogglesItsPanelUnderItsPlate)
 {
     FakePanels panels;
@@ -441,6 +506,17 @@ TEST_F(MenuBarViewTest, ThePictureBehindTheBarPicksItsColours)
     // Nothing shown: the theme decides again.
     bar->backdrop().setUnavailable();
     EXPECT_FALSE(bar->backdrop().isValid());
+
+    // Under Reduce Transparency the bar has its own fill, and its contents
+    // follow the mode, whatever is behind it.
+    render::setOpaqueBackdrop(render::Color {0.9f, 0.9f, 0.9f, 1});
+    bar->backdrop().setColor(ui::Color::rgb(0x203040));
+    EXPECT_EQ(ui::Color::rgb(0xDADADA), bar->fill());
+    EXPECT_FALSE(bar->lightContents());
+    render::setOpaqueBackdrop(std::nullopt);
+    bar->backdrop().setColor(ui::Color::rgb(0xAAAAAA));
+    EXPECT_EQ((ui::Color {0, 0, 0, 0}), bar->fill());
+    bar->backdrop().setUnavailable();
 }
 
 TEST_F(MenuBarViewTest, TrayItemsSitRightToLeftAndTakeClicks)
