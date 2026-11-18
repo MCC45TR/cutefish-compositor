@@ -28,6 +28,7 @@ public:
     void setDarkMode(bool dark);
     void setContinuousCorners(bool continuous);
     void setReduceTransparency(bool reduce);
+    void setColoredWindowControls(bool colored);
     void setAccentColor(int index);
     void setCaptionPointSize(double points);
     // The font size signal carries no value, so it is read back from the service.
@@ -39,6 +40,7 @@ private:
     base::FileWatch m_watch;
     base::dbus::Proxy m_appearance;
     std::vector<base::dbus::Match> m_signals;
+    base::dbus::PendingCall m_captionPointSizeRead;
 };
 
 } // namespace cutefish::decoration

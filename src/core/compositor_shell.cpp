@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cstdarg>
 #include <cstdio>
+#include <filesystem>
 #include <utility>
 
 #include <xkbcommon/xkbcommon.h>
@@ -302,6 +303,9 @@ CompositorShell::CompositorShell(const CompositorOptions &options)
     , m_sleepLock(&m_sessionController)
     , m_compositorInstanceId(base::Uuid::generate().toString())
 {
+    // The live medium is mounted there; its user was logged in without typing a password.
+    m_authUi.setPasswordRequired(!std::filesystem::exists("/run/live/medium"));
+
     // Before any output is up: the account the login screen preselects, so its
     // wallpaper is the first one decoded.
     if (m_options.login && !auth::lastLoginUser().empty())
