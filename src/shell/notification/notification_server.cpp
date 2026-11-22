@@ -10,6 +10,7 @@
 #include "base/logging.h"
 #include "base/strings.h"
 #include "base/url.h"
+#include "shell/common/app_launcher.h"
 #include "shell/common/file_thread.h"
 #include "shell/common/task_manager.h"
 #include "shell/notification/notification_settings.h"
@@ -23,7 +24,6 @@ static const base::LogCategory cfNotifications("cutefish.shell.notifications");
 static constexpr const char *kService = "org.freedesktop.Notifications";
 static constexpr const char *kPath = "/org/freedesktop/Notifications";
 static constexpr const char *kInterface = "org.freedesktop.Notifications";
-// A repeat counts only within this time of the first.
 static constexpr int64_t kRepeatWindowMs = 1000;
 
 static int64_t nowMs()
@@ -66,7 +66,6 @@ static int32_t intHint(const dbus::VariantMap &hints, const char *key, int32_t f
         return *v ? 1 : 0;
     if (auto v = value.get<double>())
         return int32_t(*v);
-    // A string that holds a number reads as it, anything else as 0.
     if (auto v = value.get<std::string>())
         return base::strings::toNumber<int32_t>(*v).value_or(0);
     return 0;
@@ -80,12 +79,13 @@ static std::string stringHint(const dbus::VariantMap &hints, const char *key)
 
 NotificationServer::NotificationServer(dbus::Connection *bus, NotificationSettings &settings,
                                        Applications &applications, TaskManager *tasks,
-                                       std::string imageDirectory)
+                                       std::string imageDirectory, ApplicationLauncher *launcher)
     : m_bus(bus)
     , m_settings(settings)
     , m_applications(applications)
     , m_tasks(tasks)
     , m_imageDirectory(std::move(imageDirectory))
+    , m_launcher(launcher)
 {
     m_settingsReady = m_settings.ready.connect([this] {
         const std::deque<Pending *> undecided = std::exchange(m_undecided, {});
@@ -145,14 +145,10 @@ bool NotificationServer::isOpen(uint32_t id) const
 {
     if (m_open.count(id))
         return true;
-    // On its way to the screen; it is open unless its application has
-    // notifications turned off, which is not known yet.
     const Pending *pending = pendingFor(id);
     return pending && !pending->off && !pending->closeRequested;
 }
 
-// A replacement can follow its notification before either is shown; the
-// newest one is what the application now refers to.
 NotificationServer::Pending *NotificationServer::pendingFor(uint32_t id) const
 {
     for (auto it = m_pending.rbegin(); it != m_pending.rend(); ++it) {
@@ -199,10 +195,8 @@ void NotificationServer::notify(dbus::MethodCall &call)
     notification.desktopEntry = stringHint(hints, "desktop-entry");
     notification.urgency = intHint(hints, "urgency", 1);
     notification.value = intHint(hints, "value", -1);
+    pending->relaunchId = stringHint(hints, kRelaunchHint);
 
-    // A replacement is an update the application asked for, such as
-    // progress, never a duplicate. A repeat counts only while the first is
-    // still open and offers the same actions.
     if (!wasReplaced && isOpen(m_last.id) && m_last.appName == notification.appName
         && m_last.summary == notification.summary && m_last.body == notification.body
         && m_last.actions == notification.actions && m_last.created
@@ -227,7 +221,6 @@ void NotificationServer::notify(dbus::MethodCall &call)
         const auto it = hints.find(key);
         if (it != hints.end()) {
             pending->imageData = ImageHint::fromVariant(it->second);
-            // A hint that is there but broken still wins, as an empty picture.
             if (!pending->imageData)
                 pending->imageData = ImageHint();
             break;
@@ -283,8 +276,8 @@ void NotificationServer::lookUpSender(Pending *pending)
     });
 }
 
-// A NoDisplay helper that shares the program, such as org.foo.App.kwin,
-// stands in for the installed org.foo.App, whose name and icon the user knows.
+// A NoDisplay helper that shares the program stands in for the installed
+// application, whose name and icon the user knows.
 DesktopEntryPtr NotificationServer::visibleOwner(DesktopEntryPtr entry) const
 {
     if (!entry || !entry->noDisplay)
@@ -338,7 +331,7 @@ void NotificationServer::decide(Pending *pending)
     if (path.starts_with('/'))
         notification.image = path;
     else if (!path.empty() && notification.appIcon.empty())
-        notification.appIcon = path; // An icon name rather than a picture.
+        notification.appIcon = path;
     finishImages(pending);
 }
 
@@ -348,7 +341,6 @@ void NotificationServer::finishImages(Pending *pending)
     if (pending->entry && notification.appIcon.empty())
         notification.appIcon = pending->entry->icon;
 
-    // With no icon of its own the picture stands in for it.
     if (notification.appIcon.empty() && !notification.image.empty()) {
         notification.appIcon = notification.image;
         notification.image.clear();
@@ -369,7 +361,7 @@ void NotificationServer::flush()
         Notification &notification = pending->notification;
         const uint32_t id = notification.id;
         const bool replaced = pending->wasReplaced && m_open.count(id);
-        m_open.insert(id);
+        m_open[id] = Sender{notification.service, pending->entry, pending->relaunchId};
         if (replaced) {
             notification.updated = nowMs();
             notificationReplaced(id, notification);
@@ -404,6 +396,33 @@ void NotificationServer::invokeAction(uint32_t id, const std::string &actionKey)
 {
     if (m_object)
         m_object->emitSignal("ActionInvoked", id, actionKey);
+    const auto it = m_open.find(id);
+    if (it != m_open.end())
+        relaunchIfGone(it->second, id, actionKey);
+}
+
+// A sender that asked for it and has left the bus gets its application
+// started with the action, as nothing else would hear it.
+void NotificationServer::relaunchIfGone(const Sender &sender, uint32_t id, const std::string &actionKey)
+{
+    if (!m_bus || !m_launcher || !sender.entry || sender.relaunchId.empty() || sender.service.empty())
+        return;
+
+    const std::string argument = std::string(kRelaunchScheme) + ":" + base::url::percentEncoded(sender.relaunchId)
+                                 + "?action=" + base::url::percentEncoded(actionKey);
+    const dbus::Proxy bus(m_bus, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus");
+    m_calls.track([&](std::function<void()> finished) {
+        return bus.callAsync(
+                "NameHasOwner",
+                [this, entry = sender.entry, argument, id, finished](const dbus::Reply &reply) {
+                    if (!reply.value<bool>().value_or(true)) {
+                        CF_INFO(cfNotifications) << "Starting" << entry->id << "for an action on notification" << id;
+                        m_launcher->launch(*entry, {argument});
+                    }
+                    finished();
+                },
+                sender.service);
+    });
 }
 
 void NotificationServer::closeNotification(uint32_t id, CloseReason reason)

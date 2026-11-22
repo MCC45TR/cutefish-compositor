@@ -19,8 +19,7 @@ ThemePreferences::ThemePreferences(Theme &theme)
     std::error_code error;
     std::filesystem::create_directories(std::filesystem::path(m_settings.path()).parent_path(),
                                         error);
-    // The directory is what is watched, so a file replaced by a rename is
-    // followed as well.
+    // The directory is watched, so a file replaced by a rename is followed too.
     m_watch = base::FileWatch::file(m_settings.path(), [this] { reload(); }, core::mainLoop());
     if (m_appearance.isValid()) {
         const auto readBool = [](const base::dbus::Message &message) {
@@ -41,10 +40,6 @@ ThemePreferences::ThemePreferences(Theme &theme)
                     setReduceTransparency(readBool(message));
                 }));
         m_signals.push_back(m_appearance.onSignal(
-                "coloredWindowControlsChanged", [this, readBool](const base::dbus::Message &message) {
-                    setColoredWindowControls(readBool(message));
-                }));
-        m_signals.push_back(m_appearance.onSignal(
                 "accentColorChanged", [this](const base::dbus::Message &message) {
                     int32_t index = 0;
                     if (message.read(index))
@@ -63,7 +58,6 @@ void ThemePreferences::reload()
     setDarkMode(m_settings.boolValue("Appearance/DarkMode", false));
     setContinuousCorners(m_settings.boolValue("Appearance/ContinuousCorners", true));
     setReduceTransparency(m_settings.boolValue("Appearance/ReduceTransparency", false));
-    setColoredWindowControls(m_settings.boolValue("Appearance/ColoredWindowControls", false));
     setAccentColor(int(m_settings.intValue("Appearance/AccentColor", 0)));
     setCaptionPointSize(m_settings.doubleValue("Appearance/FontSize", 9));
 }
@@ -102,11 +96,6 @@ void ThemePreferences::setContinuousCorners(bool continuous)
 void ThemePreferences::setReduceTransparency(bool reduce)
 {
     m_theme.setReduceTransparency(reduce);
-}
-
-void ThemePreferences::setColoredWindowControls(bool colored)
-{
-    m_theme.setColoredWindowControls(colored);
 }
 
 void ThemePreferences::setAccentColor(int index)

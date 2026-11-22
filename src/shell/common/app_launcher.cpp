@@ -11,8 +11,8 @@
 
 namespace cutefish::shell {
 
-// A runtime that stops answering must not leave the start hanging for the
-// bus's half minute.
+// A runtime that stops answering must not hold a start for the bus's default
+// timeout.
 static constexpr std::chrono::seconds kRuntimeTimeout(5);
 
 ApplicationLauncher::ApplicationLauncher(base::dbus::Connection *bus, TokenSource createToken)
@@ -98,6 +98,17 @@ void ApplicationLauncher::quitApplication(const std::string &appId)
 {
     if (!appId.empty())
         m_runtime.send("quitApplication", appId);
+}
+
+void ApplicationLauncher::openInFileManager(const std::string &path)
+{
+    base::dbus::Connection *bus = base::dbus::Connection::session();
+    if (!bus)
+        return;
+    base::dbus::Message message =
+            bus->newMethodCall("org.cutefish.FileManager", "/FileManager", "org.cutefish.FileManager", "openFiles");
+    message.append(std::vector<std::string>{path});
+    bus->send(message);
 }
 
 bool ApplicationLauncher::startDetached(const std::string &program, const std::vector<std::string> &arguments,

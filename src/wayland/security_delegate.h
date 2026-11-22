@@ -13,11 +13,6 @@ struct wl_client;
 
 namespace cutefish::wayland {
 
-// What a client may do beyond the ordinary protocol surface.
-//
-// Upstream: chromium/src/components/exo/security_delegate.h, narrowed to the
-// privileges Cutefish actually grants. Protocol code asks the delegate instead
-// of carrying a policy of its own.
 class SecurityDelegate
 {
 public:
@@ -31,14 +26,12 @@ public:
     // The computer-use service, which may ask the user to let an agent drive
     // the seat, and reads the screen while it does.
     virtual bool canControlComputer(const wl_client *) const { return false; }
-    // Clients that place their own windows and read where they are, as
-    // programs written for a desktop where windows do.
     virtual bool canPlaceWindows(const wl_client *) const { return false; }
+    // Their virtual keyboards type into whichever window holds the keyboard.
+    virtual bool canSendKeys(const wl_client *) const { return false; }
 };
 
-// Grants a privilege when the connecting process runs one of a fixed set of
-// executables. The pid comes from the kernel through the socket, so a client
-// cannot claim an identity it does not have.
+// The pid comes from the kernel through the socket, so a client cannot claim an identity it does not have.
 class ExecutableSecurityDelegate final : public SecurityDelegate
 {
 public:
@@ -56,9 +49,9 @@ public:
     bool showsSystemDialogs(int64_t pid) const override;
     bool canControlComputer(const wl_client *client) const override;
     bool canPlaceWindows(const wl_client *client) const override;
-    // Programs that place their own windows come from a desktop with a
-    // Command key of its own and bind it themselves: they get Command as
-    // Ctrl, never a terminal's rewritten shortcuts.
+    // The same programs as place their windows.
+    bool canSendKeys(const wl_client *client) const override;
+    // They get Command as Ctrl, never a terminal's rewritten shortcuts.
     bool bindsCommandKey(int64_t pid) const;
 
 private:

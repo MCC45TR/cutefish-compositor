@@ -16,18 +16,16 @@
 
 namespace cutefish::shell {
 
+class ApplicationLauncher;
 class Applications;
 class TaskManager;
 
-// The notifications component without its views: the
-// org.freedesktop.Notifications server, the banners on screen, the history,
-// the per-application settings, and org.cutefish.Notification at
-// /Notification, which Settings and the session call.
+// Exports org.cutefish.Notification at /Notification, which Settings and the
+// session call.
 class Notifications
 {
 public:
     struct Files {
-        // shell.conf
         std::string settings;
         std::string history;
         std::string images;
@@ -35,8 +33,10 @@ public:
         static Files defaults();
     };
 
+    // `launcher` starts a sender that has quit for an action on its
+    // notification; may be null.
     Notifications(base::dbus::Connection *bus, Applications &applications, TaskManager *tasks,
-                  Files files = Files::defaults());
+                  Files files = Files::defaults(), ApplicationLauncher *launcher = nullptr);
     ~Notifications();
 
     Notifications(const Notifications &) = delete;

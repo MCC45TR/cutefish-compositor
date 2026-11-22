@@ -2,14 +2,27 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <filesystem>
+
 #include <gtest/gtest.h>
 
+#include "base/application_registry.h"
+#include "core/main_loop.h"
 #include "dbus_test_client.h"
 #include "shell/common/application_badges.h"
 #include "shell/common/count_badge.h"
+#include "shell/common/file_theme_icon.h"
 #include "shell/common/task_manager.h"
 #include "shell/common/text_match.h"
 #include "shell_test_util.h"
+#include "temporary_directory.h"
+#include "toolkit/toolkit_host.h"
+#include "ui/bitmap.h"
+#include "ui/embedded_window.h"
 
 using namespace cutefish;
 
@@ -72,7 +85,6 @@ TEST_F(TaskManagerTest, AnnouncesApplicationsOnlyOnceTheFirstScanIsIn)
     applications.scan();
     EXPECT_TRUE(ready);
     EXPECT_TRUE(added.empty());
-    // Matched by StartupWMClass, so grouped under the desktop id.
     EXPECT_EQ(tasks->applications(), (std::vector<std::string>{"org.example.Editor"}));
 
     windows.add(window("org.example.Viewer", "Picture"));
@@ -96,19 +108,16 @@ TEST_F(TaskManagerTest, GroupsWindowsAndFollowsChanges)
     EXPECT_EQ(tasks->applicationOf(loose), "unknown-app");
 
     events.clear();
-    // A title stands for an application only without an entry.
     windows.change(first, [](shell::TaskWindow &w) { w.title = "One!"; }, shell::kTitleChange);
     windows.change(loose, [](shell::TaskWindow &w) { w.title = "Loose!"; }, shell::kTitleChange);
     EXPECT_EQ(events, (std::vector<std::string>{"~unknown-app"}));
 
     events.clear();
-    // Leaving the task list leaves the application.
     windows.change(loose, [](shell::TaskWindow &w) { w.skipTaskbar = true; }, shell::kSkipTaskbarChange);
     EXPECT_EQ(events, (std::vector<std::string>{"-unknown-app"}));
     EXPECT_EQ(tasks->applicationOf(loose), "");
 
     events.clear();
-    // A new app id moves the window to the application it names.
     windows.change(second, [](shell::TaskWindow &w) { w.appId = "org.example.Viewer"; }, shell::kAppIdChange);
     EXPECT_EQ(events, (std::vector<std::string>{"~org.example.Editor", "+org.example.Viewer"}));
 
@@ -126,12 +135,10 @@ TEST_F(TaskManagerTest, KeepsAWindowWithItsEntryThroughARescan)
     std::vector<std::string> events;
     auto changed = tasks->applicationChanged.connect([&](const std::string &a) { events.push_back(a); });
 
-    // The same entry read again is no change.
     applications.addSimple("org.example.Editor", "Editor", "editor", "StartupWMClass=editor-window\n");
     applications.scan();
     EXPECT_TRUE(events.empty());
 
-    // A new name is.
     applications.addSimple("org.example.Editor", "Better Editor", "editor");
     applications.scan();
     EXPECT_EQ(events, (std::vector<std::string>{"org.example.Editor"}));
@@ -151,10 +158,59 @@ TEST_F(TaskManagerTest, FindsTheEntryOfAProcessThroughItsAncestors)
     EXPECT_EQ(tasks->entryForProcess(105)->id, "org.example.Editor");
     tasks->releaseProcess(101);
 
-    // The program names it when nothing else does.
     commands[200] = {"/usr/bin/org.example.Editor", "org.example.Editor"};
     EXPECT_EQ(tasks->resolveProcess({}, 200, {})->id, "org.example.Editor");
     EXPECT_EQ(tasks->entryForProcess(300), nullptr);
+}
+
+static std::string infoPlist(const std::string &name)
+{
+    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>"
+           "<key>CFBundleName</key><string>" + name + "</string>"
+           "<key>CFBundleIdentifier</key><string>org.example." + name + "</string>"
+           "</dict></plist>\n";
+}
+
+static std::vector<std::string> names(const shell::Applications &applications)
+{
+    std::vector<std::string> list;
+    for (const shell::DesktopEntryPtr &entry : applications.applications())
+        list.push_back(entry->name);
+    return list;
+}
+
+TEST(RegistryApplicationsTest, ListsInstalledBundlesWhileNothingRunsThem)
+{
+    const test::TemporaryDirectory directory;
+    ASSERT_TRUE(directory.write("applications/files.desktop",
+                                "[Desktop Entry]\nType=Application\nName=Files\nExec=files\n"));
+    ASSERT_TRUE(directory.write("Applications/Editor.app/Contents/Info.plist", infoPlist("Editor")));
+    ASSERT_TRUE(directory.write("Applications/Zebra.app/Contents/Info.plist", infoPlist("Zebra")));
+
+    base::EventLoop &loop = *core::mainLoop();
+    base::ApplicationRegistry::setInstance(
+            loop, base::ApplicationRegistry::create(loop, {directory.filePath("applications")},
+                                                    {directory.filePath("Applications")}));
+    {
+        shell::RegistryApplications applications;
+        ASSERT_TRUE(test::runUntil(
+                [&] { return !applications.isLoading() && applications.applications().size() == 3; }));
+        EXPECT_EQ(names(applications), (std::vector<std::string>{"Editor", "Files", "Zebra"}));
+        const shell::DesktopEntryPtr editor = applications.byPath(directory.filePath("Applications/Editor.app"));
+        ASSERT_TRUE(editor);
+        EXPECT_TRUE(editor->exec.empty());
+
+        // Once something runs them, they are listed once, with its command.
+        ASSERT_TRUE(directory.write("applications/runner.desktop",
+                                    "[Desktop Entry]\nType=Application\nName=Runner\nExec=runner %f\n"
+                                    "MimeType=application/x-apple-app;\nNoDisplay=true\n"));
+        ASSERT_TRUE(test::runUntil([&] {
+            const shell::DesktopEntryPtr entry = applications.byPath(directory.filePath("Applications/Editor.app"));
+            return entry && !entry->exec.empty();
+        }));
+        EXPECT_EQ(names(applications), (std::vector<std::string>{"Editor", "Files", "Zebra"}));
+    }
+    base::ApplicationRegistry::setInstance(loop, nullptr);
 }
 
 TEST(ApplicationBadgesTest, NamesTheDesktopIdOfALauncherUri)
@@ -190,11 +246,9 @@ TEST(ApplicationBadgesTest, FollowsTheCountsApplicationsSend)
                                                 {"count-visible", dbus::Variant(true)}});
     ASSERT_TRUE(test::runUntil([&] { return badges.count("org.example.Chat") == 7; }));
     EXPECT_EQ(changes, 1);
-    // Desktop ids match ignoring case.
     EXPECT_EQ(badges.count("org.example.chat"), 7);
     EXPECT_EQ(badges.count("org.example.Other"), 0);
 
-    // Each update carries only what changed.
     client->sendLauncherEntry("application://org.example.Chat.desktop",
                               dbus::VariantMap {{"count", dbus::Variant(int64_t(120))}});
     ASSERT_TRUE(test::runUntil([&] { return badges.count("org.example.Chat") == 120; }));
@@ -204,7 +258,6 @@ TEST(ApplicationBadgesTest, FollowsTheCountsApplicationsSend)
     client->sendLauncherEntry("application://org.example.Chat.desktop",
                               dbus::VariantMap {{"count-visible", dbus::Variant(true)}});
     ASSERT_TRUE(test::runUntil([&] { return badges.count("org.example.Chat") == 120; }));
-    // A count of zero shows nothing.
     client->sendLauncherEntry("application://org.example.Chat.desktop",
                               dbus::VariantMap {{"count", dbus::Variant(int64_t(0))}});
     ASSERT_TRUE(test::runUntil([&] { return badges.count("org.example.Chat") == 0; }));
@@ -213,8 +266,55 @@ TEST(ApplicationBadgesTest, FollowsTheCountsApplicationsSend)
     ASSERT_TRUE(test::runUntil([&] { return badges.count("org.example.Chat") == 3; }));
     changes = 0;
 
-    // The count goes with the application.
     client.reset();
     ASSERT_TRUE(test::runUntil([&] { return badges.count("org.example.Chat") == 0; }));
     EXPECT_EQ(changes, 1);
+}
+
+namespace {
+
+uint8_t centreAlpha(const ui::EmbeddedWindow::Frame &frame)
+{
+    const int x = frame.width / 2;
+    const int y = frame.height / 2;
+    return frame.pixels[size_t(y) * frame.stride + size_t(x) * 4 + 3];
+}
+
+} // namespace
+
+TEST(FileThemeIconTest, ReadsItsFileOnThePoolAndDrawsOnceItIsThere)
+{
+    toolkit::application();
+    const std::string directory = testing::TempDir() + "file-theme-icon";
+    std::filesystem::create_directories(directory);
+    const std::string file = directory + "/AppIcon.png";
+    ui::Bitmap art(32, 32, ui::Bitmap::Format::Argb32Premultiplied);
+    art.fill(0xff3385ff);
+    ASSERT_TRUE(art.savePng(file));
+
+    ui::EmbeddedWindow window;
+    auto content = std::make_unique<shell::FileThemeIcon>(file, 32);
+    shell::FileThemeIcon *icon = content.get();
+    window.setContentView(std::move(content));
+    window.setSize({32, 32});
+    EXPECT_EQ(centreAlpha(window.render()), 0);
+    ASSERT_TRUE(test::runUntil([&window] { return window.needsRender(); }));
+    EXPECT_EQ(centreAlpha(window.render()), 255);
+
+    // A file whose reads hang, as on a stuck mount, never holds up a frame.
+    const std::string fifo = directory + "/Stuck.png";
+    ASSERT_EQ(mkfifo(fifo.c_str(), 0600), 0);
+    icon->setIconName(fifo);
+    EXPECT_EQ(centreAlpha(window.render()), 0);
+    EXPECT_FALSE(shell::FileThemeIcon::isReady(fifo, 32, 1, {}));
+    // Lets the pool's read go: a writer opens once the read waits.
+    int writer = -1;
+    ASSERT_TRUE(test::runUntil([&] {
+        writer = open(fifo.c_str(), O_WRONLY | O_NONBLOCK);
+        return writer >= 0;
+    }));
+    close(writer);
+    ASSERT_TRUE(test::runUntil([&] { return shell::FileThemeIcon::isReady(fifo, 32, 1, {}); }));
+    EXPECT_EQ(centreAlpha(window.render()), 0);
+    std::filesystem::remove_all(directory);
 }

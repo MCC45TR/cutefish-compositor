@@ -23,7 +23,6 @@ TEST(XkbTrackerTest, TheDefaultKeymapCompilesAndIsSerializable)
     const std::string keymap = tracker.keymap();
 
     EXPECT_FALSE(keymap.empty());
-    // The keymap the client receives has to be parseable text, not a blob.
     EXPECT_NE(std::string::npos, keymap.find("xkb_keymap"));
     EXPECT_NE(std::string::npos, keymap.find("xkb_symbols"));
 }
@@ -31,7 +30,6 @@ TEST(XkbTrackerTest, TheDefaultKeymapCompilesAndIsSerializable)
 TEST(XkbTrackerTest, KeysymsFollowTheEvdevOffset)
 {
     XkbTracker tracker;
-    // Nothing is pressed, so 'a' is lowercase.
     EXPECT_EQ(XKB_KEY_a, tracker.keysym(KEY_A));
     EXPECT_EQ(XKB_KEY_1, tracker.keysym(KEY_1));
 }
@@ -63,20 +61,36 @@ TEST(XkbTrackerTest, CapsLockLatchesIntoTheLockedMask)
     EXPECT_EQ(XKB_KEY_A, tracker.keysym(KEY_A));
 }
 
+TEST(XkbTrackerTest, NumLockStartsOn)
+{
+    XkbTracker tracker;
+    EXPECT_TRUE(tracker.modifierActive(XKB_MOD_NAME_NUM));
+    EXPECT_EQ(KeyboardLed::NumLock, tracker.leds());
+    EXPECT_EQ(XKB_KEY_KP_1, tracker.keysym(KEY_KP1));
+    EXPECT_EQ(0u, tracker.modifiers().depressed);
+
+    tracker.updateKey(KEY_NUMLOCK, true);
+    tracker.updateKey(KEY_NUMLOCK, false);
+    EXPECT_FALSE(tracker.modifierActive(XKB_MOD_NAME_NUM));
+    EXPECT_EQ(XKB_KEY_KP_End, tracker.keysym(KEY_KP1));
+}
+
 TEST(XkbTrackerTest, TheLockLightsFollowTheLocks)
 {
     XkbTracker tracker;
-    EXPECT_EQ(0u, tracker.leds());
+    EXPECT_EQ(KeyboardLed::NumLock, tracker.leds());
 
     tracker.updateKey(KEY_CAPSLOCK, true);
     tracker.updateKey(KEY_CAPSLOCK, false);
+    EXPECT_EQ(KeyboardLed::CapsLock | KeyboardLed::NumLock, tracker.leds());
+    tracker.updateKey(KEY_NUMLOCK, true);
+    tracker.updateKey(KEY_NUMLOCK, false);
+    EXPECT_EQ(KeyboardLed::CapsLock, tracker.leds());
+
+    ASSERT_TRUE(tracker.updateKeyboardLayout("de"));
     EXPECT_EQ(KeyboardLed::CapsLock, tracker.leds());
     tracker.updateKey(KEY_NUMLOCK, true);
     tracker.updateKey(KEY_NUMLOCK, false);
-    EXPECT_EQ(KeyboardLed::CapsLock | KeyboardLed::NumLock, tracker.leds());
-
-    // A layout change keeps both locks, and with them the lights.
-    ASSERT_TRUE(tracker.updateKeyboardLayout("de"));
     EXPECT_EQ(KeyboardLed::CapsLock | KeyboardLed::NumLock, tracker.leds());
     tracker.updateKey(KEY_CAPSLOCK, true);
     tracker.updateKey(KEY_CAPSLOCK, false);
@@ -93,12 +107,12 @@ TEST(XkbTrackerTest, CopyingLocksKeepsTheHeldModifiers)
 
     EXPECT_TRUE(tracker.copyLocks(source));
     EXPECT_FALSE(tracker.copyLocks(source));
-    EXPECT_EQ(KeyboardLed::CapsLock, tracker.leds());
+    EXPECT_EQ(KeyboardLed::CapsLock | KeyboardLed::NumLock, tracker.leds());
     EXPECT_TRUE(tracker.modifierPressed(XKB_MOD_NAME_SHIFT));
 
     tracker.updateKey(KEY_LEFTSHIFT, false);
     EXPECT_FALSE(tracker.modifierPressed(XKB_MOD_NAME_SHIFT));
-    EXPECT_EQ(KeyboardLed::CapsLock, tracker.leds());
+    EXPECT_EQ(KeyboardLed::CapsLock | KeyboardLed::NumLock, tracker.leds());
 }
 
 TEST(XkbTrackerTest, ANamedLayoutReplacesTheKeymap)
@@ -109,7 +123,6 @@ TEST(XkbTrackerTest, ANamedLayoutReplacesTheKeymap)
     ASSERT_TRUE(tracker.updateKeyboardLayout("de"));
     const std::string german = tracker.keymap();
     EXPECT_NE(original, german);
-    // On a German layout the key at the QWERTY 'y' position produces 'z'.
     EXPECT_EQ(XKB_KEY_z, tracker.keysym(KEY_Y));
 }
 
@@ -124,7 +137,6 @@ TEST(XkbTrackerTest, ALayoutChangeKeepsTheLocksAndAnEmptyNameRestoresTheDefault)
     ASSERT_TRUE(tracker.updateKeyboardLayout("de"));
     EXPECT_EQ("de", tracker.layoutName());
     EXPECT_TRUE(tracker.modifierActive(XKB_MOD_NAME_CAPS));
-    // Held keys are the seat's to replay; the tracker starts with none.
     EXPECT_FALSE(tracker.modifierPressed(XKB_MOD_NAME_SHIFT));
 
     ASSERT_TRUE(tracker.updateKeyboardLayout(""));
@@ -157,7 +169,6 @@ TEST(XkbTrackerTest, AKeyStrokeUsesTheFewestModifiers)
     EXPECT_EQ(uint32_t(KEY_1), shifted->key);
     EXPECT_EQ(std::vector<uint32_t> {KEY_LEFTSHIFT}, shifted->modifiers);
 
-    // Nothing on a US layout types Greek.
     EXPECT_FALSE(tracker.keyStroke(XKB_KEY_Greek_alpha));
     EXPECT_FALSE(tracker.keyStroke(XKB_KEY_NoSymbol));
 }

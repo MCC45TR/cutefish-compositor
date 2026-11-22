@@ -13,10 +13,8 @@
 namespace cutefish::decoration {
 class Theme;
 
-// Follows the session's dark mode, corner style, accent and font size into the
-// server-side frame and window silhouettes: the shared `cutefish/theme`
-// settings file, and the Appearance service's signals for the changes
-// themselves, since the service writes the file lazily.
+// The service writes the settings file lazily, so its signals carry the
+// changes.
 class ThemePreferences
 {
 public:
@@ -28,7 +26,6 @@ public:
     void setDarkMode(bool dark);
     void setContinuousCorners(bool continuous);
     void setReduceTransparency(bool reduce);
-    void setColoredWindowControls(bool colored);
     void setAccentColor(int index);
     void setCaptionPointSize(double points);
     // The font size signal carries no value, so it is read back from the service.

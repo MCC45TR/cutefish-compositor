@@ -41,7 +41,6 @@ const char* iconName(CaptionButtonType type, bool restore)
     return "";
 }
 
-// The centre of the last pixels inside: an even width rounds toward the origin.
 base::Point innerCenter(const base::Rect& rect)
 {
     return {(2 * rect.x() + rect.width() - 1) / 2, (2 * rect.y() + rect.height() - 1) / 2};
@@ -114,8 +113,7 @@ void DecorationNode::paintCaption(render::Renderer& renderer, const base::Rect& 
             m_theme->textRenderer().renderText(text, metrics.textPixelSize, color, scale);
         if (image.size().isEmpty())
             return;
-        // Padded to the pixels its whole-unit target covers, so every texel
-        // lands on one physical pixel instead of being resampled.
+        // Padded so every texel lands on one physical pixel.
         const base::Size logical(int(std::ceil(image.size().width() / scale)),
                                  int(std::ceil(image.size().height() / scale)));
         const base::Size pixels(base::roundToInt(logical.width() * scale),
@@ -141,10 +139,7 @@ void DecorationNode::paintCaption(render::Renderer& renderer, const base::Rect& 
     }
     render::Texture* texture = caption->texture.get();
 
-    // Centred in the titlebar, and moved into the space beside the buttons when
-    // centring would put it under them: the rule the Cutefish KWin decoration
-    // used, which keeps the caption off the buttons without ever centring it in
-    // a box that is not the window.
+    // Moved beside the buttons when centring would put it under them.
     const base::Size size(base::roundToInt(texture->size().width() / scale),
                           base::roundToInt(texture->size().height() / scale));
     base::Rect target(base::Point(0, 0), size);
@@ -171,12 +166,10 @@ void DecorationNode::paintButtons(render::Renderer& renderer, const base::Rect& 
         state.artwork = iconName(button.type(), m_decoration->isRestoreButton());
         state.dark = m_theme->darkMode();
         state.active = m_decoration->isActive();
-        state.colored = m_theme->coloredWindowControls();
-        state.hovered = button.isHovered() || (state.colored && m_decoration->isControlsHovered());
+        state.hovered = button.isHovered();
         state.pressed = button.isPressed();
-        const std::string key = std::format("control:{}:{}:{}{}{}{}{}", scale, state.artwork, int(state.dark),
-                                            int(state.active), int(state.hovered), int(state.pressed),
-                                            int(state.colored));
+        const std::string key = std::format("control:{}:{}:{}{}{}{}", scale, state.artwork, int(state.dark),
+                                            int(state.active), int(state.hovered), int(state.pressed));
         render::Texture* texture = m_theme->texture(renderer, key, [&] {
             return ui::window_controls::render(state, scale, ui::Bitmap::Format::Rgba8888Premultiplied);
         });

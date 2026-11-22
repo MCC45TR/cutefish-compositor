@@ -16,6 +16,7 @@
 #include "base/settings.h"
 #include "dbus_test_client.h"
 #include "loop_test_util.h"
+#include "shell/common/app_launcher.h"
 #include "shell/common/file_thread.h"
 #include "shell/common/task_manager.h"
 #include "shell/notification/notifications.h"
@@ -57,7 +58,8 @@ protected:
         notifications = std::make_unique<shell::Notifications>(
                 dbus::Connection::session(core::mainLoop()), applications, tasks.get(),
                 shell::Notifications::Files{directory.filePath("shell.conf"), directory.filePath("history"),
-                                            directory.filePath("images")});
+                                            directory.filePath("images")},
+                &launcher);
         ASSERT_TRUE(notifications->registerServices());
         ASSERT_TRUE(test::runUntil([this] {
             return notifications->settings().isReady() && notifications->history().isLoaded();
@@ -74,7 +76,6 @@ protected:
         return reply.value<uint32_t>().value_or(0);
     }
 
-    // Lets the lookups behind the notifications finish.
     void settle()
     {
         test::runFor(std::chrono::milliseconds(50));
@@ -87,8 +88,28 @@ protected:
     test::FakeTaskWindows windows;
     std::map<int64_t, shell::ProcessCommand> commands;
     std::unique_ptr<shell::TaskManager> tasks;
+    shell::ApplicationLauncher launcher{dbus::Connection::session(core::mainLoop())};
     std::unique_ptr<shell::Notifications> notifications;
     test::DBusTestClient client;
+};
+
+class FakeAppRuntime
+{
+public:
+    explicit FakeAppRuntime(dbus::Connection *bus)
+        : object(bus, "/AppRuntime", "org.cutefish.AppRuntime")
+    {
+        object.addMethod("launchApplication", [this](const std::string &id, const std::vector<std::string> &files,
+                                                     const std::string &) {
+            launched.push_back({id, files});
+            return uint32_t(1);
+        });
+        EXPECT_TRUE(object.publish());
+        EXPECT_TRUE(bus->requestName("org.cutefish.AppRuntime"));
+    }
+
+    dbus::Object object;
+    std::vector<std::pair<std::string, std::vector<std::string>>> launched;
 };
 
 } // namespace
@@ -135,7 +156,6 @@ TEST_F(NotificationServiceTest, ShowsANotificationAsTheSendersApplication)
     EXPECT_EQ(shown.actionList().front().key, "reply");
     EXPECT_EQ(shown.service, client.connection->uniqueName());
 
-    // The sender is noted for Settings.
     const dbus::Reply applications =
             client.call("org.cutefish.Notification", "/Notification", "org.cutefish.Notification", "applications");
     const auto list = applications.value<std::vector<dbus::VariantMap>>();
@@ -144,6 +164,44 @@ TEST_F(NotificationServiceTest, ShowsANotificationAsTheSendersApplication)
     EXPECT_EQ(list->front().at("key").value<std::string>(), "org.example.Chat");
     EXPECT_EQ(list->front().at("name").value<std::string>(), "Chat");
     EXPECT_EQ(list->front().at("mode").value<int32_t>(), 0);
+}
+
+TEST_F(NotificationServiceTest, StartsASenderThatQuitForAnAction)
+{
+    test::DBusTestClient runtimeClient;
+    FakeAppRuntime runtime(runtimeClient.connection.get());
+    start();
+
+    auto sender = std::make_unique<test::DBusTestClient>();
+    const dbus::VariantMap hints{{"x-cutefish-relaunch-id", dbus::Variant(std::string("a b"))}};
+    const std::vector<std::string> actions{"default", "", "show", "Show"};
+    const uint32_t id = sender->call(kService, kPath, kService, "Notify", std::string("chat"), uint32_t(0),
+                                     std::string(), std::string("Done"), std::string(), actions, hints, int32_t(-1))
+                                .value<uint32_t>()
+                                .value_or(0);
+    const uint32_t plain = notify("Plain", 0, {}, actions);
+    settle();
+    ASSERT_EQ(notifications->banners().count(), 2);
+
+    // Still on the bus: the signal is enough.
+    notifications->banners().invokeAction(id, "show");
+    settle();
+    EXPECT_TRUE(runtime.launched.empty());
+
+    sender.reset();
+    settle();
+    notifications->banners().invokeAction(id, "show");
+    ASSERT_TRUE(test::runUntil([&] { return !runtime.launched.empty(); }));
+    EXPECT_EQ(runtime.launched.front().first, "org.example.Chat");
+    EXPECT_EQ(runtime.launched.front().second,
+              std::vector<std::string>{"cutefish-notification:a%20b?action=show"});
+
+    // A sender that gave no id to come back with is not started.
+    client.connection.reset();
+    settle();
+    notifications->banners().invokeAction(plain, "show");
+    settle();
+    EXPECT_EQ(runtime.launched.size(), 1u);
 }
 
 TEST_F(NotificationServiceTest, ReplacesInPlaceAndFoldsRepeats)
@@ -160,9 +218,7 @@ TEST_F(NotificationServiceTest, ReplacesInPlaceAndFoldsRepeats)
     EXPECT_EQ(notifications->banners().notifications().front().created, created);
     EXPECT_TRUE(notifications->banners().notifications().front().updated.has_value());
 
-    // The same text again within a second is the same notification.
     EXPECT_EQ(notify("Progress 50%"), first);
-    // A closed id is not reused: replacing it gives a new one.
     notifications->banners().close(first);
     settle();
     EXPECT_EQ(notify("Again", first), first + 1);
@@ -194,7 +250,6 @@ TEST_F(NotificationServiceTest, ReplacesAndClosesWhatIsNotShownYet)
     EXPECT_EQ(banners.back().id, progress);
     EXPECT_EQ(banners.back().summary, "Progress 50%");
 
-    // Nothing waits behind them.
     notify("Later");
     settle();
     EXPECT_EQ(notifications->banners().notifications().back().summary, "Later");
@@ -220,7 +275,6 @@ TEST_F(NotificationServiceTest, ClosesWithTheSpecsSignalOrError)
     EXPECT_TRUE(again.isError());
     EXPECT_EQ(again.error().name, "org.freedesktop.DBus.Error.InvalidArgs");
 
-    // A banner that times out goes to the history, without its actions.
     const uint32_t expiring = notify("Later", 0, {}, {"default", "Open"});
     settle();
     client.signalsSeen.clear();
@@ -253,14 +307,11 @@ TEST_F(NotificationServiceTest, CachesAnImageAsASquareThumbnail)
     ASSERT_EQ(stat(directory.filePath("images").c_str(), &info), 0);
     EXPECT_EQ(info.st_mode & 0777, 0700u);
 
-    // A broken picture still wins over the path, as nothing.
     notify("Broken", 0, {{"image-data", dbus::Variant(ImageData(10000, 1, 4, true, 8, 4, {}))},
                          {"image-path", dbus::Variant(std::string("/tmp/x.png"))}});
     settle();
     EXPECT_TRUE(notifications->banners().notifications().back().image.empty());
 
-    // An icon name in image-path stands in for a missing app icon; a file
-    // is the picture.
     notify("Named", 0, {{"image-path", dbus::Variant(std::string("file:///tmp/picture.png"))}});
     settle();
     EXPECT_EQ(notifications->banners().notifications().back().image, "/tmp/picture.png");
@@ -270,14 +321,12 @@ TEST_F(NotificationServiceTest, FollowsTheApplicationModesAndDoNotDisturb)
 {
     start("[Notifications]\nApplications\\org.example.Chat\\Mode=2\n"
           "Applications\\org.example.Chat\\Name=Chat\n");
-    // Off: the id is handed out, nothing shows.
     EXPECT_EQ(notify("Muted"), 1u);
     settle();
     EXPECT_EQ(notifications->banners().count(), 0);
     EXPECT_EQ(notifications->history().count(), 0);
     EXPECT_TRUE(client.call(kService, kPath, kService, "CloseNotification", uint32_t(1)).isError());
 
-    // Centre only: straight to the history.
     EXPECT_FALSE(client.call("org.cutefish.Notification", "/Notification", "org.cutefish.Notification",
                              "setApplicationMode", std::string("org.example.Chat"), int32_t(1))
                          .isError());
@@ -286,7 +335,6 @@ TEST_F(NotificationServiceTest, FollowsTheApplicationModesAndDoNotDisturb)
     EXPECT_EQ(notifications->banners().count(), 0);
     EXPECT_EQ(notifications->history().count(), 1);
 
-    // Saved in shell.conf.
     shell::waitForFileThread();
     base::Settings saved(directory.filePath("shell.conf"));
     EXPECT_EQ(saved.intValue("Notifications/Applications/org.example.Chat/Mode"), 1);
@@ -303,7 +351,6 @@ TEST_F(NotificationServiceTest, FollowsTheApplicationModesAndDoNotDisturb)
     EXPECT_EQ(notifications->banners().count(), 0);
     EXPECT_EQ(notifications->history().count(), 2);
 
-    // A critical notification shows as a banner through both.
     notify("Battery", 0, {{"urgency", dbus::Variant(uint8_t(2))}});
     settle();
     ASSERT_EQ(notifications->banners().count(), 1);
@@ -320,7 +367,6 @@ TEST_F(NotificationServiceTest, KeepsAtMostFiveBanners)
     EXPECT_EQ(notifications->banners().count(), 5);
     EXPECT_EQ(notifications->banners().notifications().front().summary, "Note 2");
     EXPECT_EQ(notifications->history().count(), 2);
-    // The history heads with the newest.
     EXPECT_EQ(notifications->history().notifications().front().summary, "Note 1");
 
     notifications->banners().setBannersSuppressed(true);
@@ -342,7 +388,6 @@ TEST_F(NotificationServiceTest, KeepsTheHistoryAsJson)
     EXPECT_EQ(notifications->history().notifications()[0].desktopEntry, "org.example.App");
     EXPECT_EQ(notifications->history().notifications()[1].image, "/tmp/x.png");
 
-    // A new one from the first record's application joins it at the top.
     Notification note;
     note.desktopEntry = "org.example.App";
     note.summary = "New";
@@ -388,8 +433,6 @@ TEST(NotificationTimeTest, CountsMinutesHoursAndDays)
     EXPECT_FALSE(shell::friendlyTime(now - 30 * 86400000LL, now).empty());
 }
 
-// The cache is its own directory, and only what the shell wrote there goes:
-// an older cache's pictures and anything else are left alone.
 TEST(NotificationImagesTest, PrunesOnlyItsOwnPictures)
 {
     EXPECT_EQ(base::paths::cacheHome() + "/cutefish/notification-images",

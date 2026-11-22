@@ -18,7 +18,6 @@
 
 namespace cutefish::test {
 
-// Installed applications of a test's own, from desktop file text.
 class FakeApplications : public shell::Applications
 {
 public:
@@ -39,7 +38,6 @@ public:
                         + extra);
     }
 
-    // An application bundle outside ~/Applications, as the registry reads one.
     void addBundle(const std::string &path, const std::string &name, const std::string &icon)
     {
         base::DesktopEntry entry;
@@ -56,13 +54,26 @@ public:
         rebuild();
     }
 
+    // Installed while nothing runs bundles: listed, with no command.
+    void addUnhandledBundle(const std::string &path, const std::string &name)
+    {
+        base::DesktopEntry entry;
+        entry.id = path;
+        entry.path = path;
+        entry.type = "Application";
+        entry.name = name;
+        entry.bundle = true;
+        std::erase_if(m_entries, [&path](const shell::DesktopEntryPtr &e) { return e->id == path; });
+        m_entries.push_back(std::make_shared<const base::DesktopEntry>(std::move(entry)));
+        rebuild();
+    }
+
     void remove(const std::string &id)
     {
         std::erase_if(m_entries, [&id](const shell::DesktopEntryPtr &e) { return e->id == id; });
         rebuild();
     }
 
-    // Announces a finished scan.
     void scan()
     {
         m_loading = false;
@@ -117,7 +128,7 @@ private:
     {
         m_applications.clear();
         for (const auto &entry : m_entries) {
-            if (entry->shouldShow({"Cutefish"}))
+            if (entry->shouldShow({"Cutefish"}) || (entry->bundle && entry->exec.empty() && !entry->noDisplay))
                 m_applications.push_back(entry);
         }
         std::sort(m_applications.begin(), m_applications.end(),
@@ -129,7 +140,6 @@ private:
     bool m_loading = true;
 };
 
-// Application windows of a test's own; requests are recorded.
 class FakeTaskWindows : public shell::TaskWindows
 {
 public:
