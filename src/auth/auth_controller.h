@@ -79,22 +79,42 @@ public:
 
     void setUserName(const std::string &name);
 
+    // The panel is prepared ahead of the lock; this asks then what the lock
+    // screen should lead with, so it opens on the right prompt.
+    void prepare();
     void start();
     // Wipes the password it is given once it holds it as a Secret.
     void authenticate(std::string password);
     void unlockWithoutPassword();
     void reset();
+    // Someone is at the lock screen: the reader, which stops after a while
+    // without a finger, is offered again.
+    void userActive();
+
+    // Lock only, for a user with an enrolled finger: the screen then leads with
+    // the reader and keeps the password field until it is asked for.
+    bool fingerprintOffered() const;
+    // Too many fingers that did not match: only the password unlocks now.
+    bool fingerprintLockedOut() const { return m_fingerprintFailures >= kFingerprintAttempts; }
+
+    // Fingers that did not match before the password field is put forward.
+    static constexpr int kFingerprintPasswordAfter = 3;
+    static constexpr int kFingerprintAttempts = 5;
 
     base::Signal<> stateChanged;
     base::Signal<> userChanged;
     base::Signal<> sessionChanged;
     base::Signal<> sessionsChanged;
     base::Signal<> usersChanged;
+    base::Signal<> fingerprintChanged;
+    // A finger did not match, kFingerprintPasswordAfter times or more.
+    base::Signal<> passwordAsked;
     base::Signal<> authenticationFailed;
     // Emitted once.
     base::Signal<> authenticationSucceeded;
 
 private:
+    void startFingerprint();
     void setState(State state, const std::string &errorMessage = {});
     void resolveUser();
     void selectSessionFor(const std::string &userName);
@@ -110,6 +130,8 @@ private:
     std::string m_iconSource;
     std::string m_iconStamp;
     std::string m_errorMessage;
+    int m_fingerprintFailures = 0;
+    bool m_started = false;
     std::vector<std::string> m_users;
     std::vector<std::string> m_userIcons;
     std::vector<std::string> m_userIconStamps;

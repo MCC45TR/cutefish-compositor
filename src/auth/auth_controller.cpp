@@ -76,6 +76,8 @@ AuthController::AuthController(Mode mode, AuthBackend *backend)
             return;
         setState(Failed, message);
         authenticationFailed();
+        // authenticate() stopped the reader for the password that just failed.
+        startFingerprint();
     }));
     m_backendSubscriptions.push_back(m_backend->succeeded.connect([this] {
         // Only an outstanding attempt can authorize a transition.
@@ -88,6 +90,35 @@ AuthController::AuthController(Mode mode, AuthBackend *backend)
         m_backend->accept();
         authenticationSucceeded();
     }));
+    // The reader can verify while nothing is being typed, so this is not tied
+    // to Authenticating; it only needs the session not to be open yet.
+    m_backendSubscriptions.push_back(m_backend->fingerprintSucceeded.connect([this] {
+        if (m_accepted || m_state == Succeeded || fingerprintLockedOut())
+            return;
+        m_accepted = true;
+        setState(Succeeded);
+        m_backend->accept();
+        authenticationSucceeded();
+    }));
+    m_backendSubscriptions.push_back(m_backend->fingerprintNoMatch.connect([this] {
+        if (m_mode != Lock || m_accepted || m_state == Succeeded)
+            return;
+        ++m_fingerprintFailures;
+        if (fingerprintLockedOut()) {
+            m_backend->stopFingerprint();
+            fingerprintChanged();
+        }
+        if (m_fingerprintFailures >= kFingerprintPasswordAfter)
+            passwordAsked();
+    }));
+    m_backendSubscriptions.push_back(m_backend->fingerprintEnrollmentChanged.connect([this] {
+        fingerprintChanged();
+        if (fingerprintOffered())
+            startFingerprint();
+        else
+            m_backend->stopFingerprint();
+    }));
+    m_backendSubscriptions.push_back(m_backend->systemWoke.connect([this] { startFingerprint(); }));
     resolveUser();
     if (m_mode == Login) {
         setUsers(findLoginUsers());
@@ -254,8 +285,40 @@ std::string AuthController::iconFor(const std::string &userName) const
 
 void AuthController::start()
 {
+    m_started = true;
     if (passwordRequired())
         m_backend->start();
+    // Again: a finger may have been enrolled since the panel was prepared.
+    prepare();
+    startFingerprint();
+}
+
+void AuthController::prepare()
+{
+    if (m_mode == Lock && passwordRequired())
+        m_backend->checkFingerprintEnrollment(m_userName);
+}
+
+void AuthController::userActive()
+{
+    startFingerprint();
+}
+
+bool AuthController::fingerprintOffered() const
+{
+    // Only the lock screen offers the reader: a login that skips the password
+    // cannot unlock the keyring, so it stays password-first until the login
+    // flow can wait for a secret after a failed touch.
+    return m_mode == Lock && passwordRequired() && m_backend->fingerprintAvailable(m_userName)
+            && m_backend->fingerprintEnrolled();
+}
+
+void AuthController::startFingerprint()
+{
+    if (!m_started || !fingerprintOffered() || fingerprintLockedOut() || m_accepted
+        || m_state == Succeeded || m_state == Authenticating)
+        return;
+    m_backend->startFingerprint(m_userName);
 }
 
 void AuthController::authenticate(std::string password)
@@ -264,6 +327,8 @@ void AuthController::authenticate(std::string password)
     wipeString(password);
     if (!passwordRequired() || m_state == Authenticating || m_state == Succeeded)
         return;
+    // A typed password wins over a finger still being waited for.
+    m_backend->stopFingerprint();
     setState(Authenticating);
     if (m_sessionIndex >= 0 && m_sessionIndex < int(m_sessions.size()))
         m_backend->setSession(m_sessions[size_t(m_sessionIndex)]);

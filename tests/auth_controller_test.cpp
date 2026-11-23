@@ -282,3 +282,165 @@ TEST(AuthControllerTest, APasswordStaysRequiredAtLoginAndWhereAsked)
     EXPECT_EQ(lock.state(), AuthController::Idle);
     EXPECT_EQ(lockBackend.acceptCount, 0);
 }
+
+TEST(AuthControllerTest, TheLockOffersTheReaderAndAFingerUnlocksOnce)
+{
+    FakeBackend backend;
+    backend.hasReader = true;
+    backend.enrolled = true;
+    AuthController controller(AuthController::Lock, &backend);
+    int successes = 0;
+    auto succeeded = controller.authenticationSucceeded.connect([&] { ++successes; });
+
+    controller.start();
+    EXPECT_EQ(backend.fingerprintStartCount, 1);
+    EXPECT_TRUE(backend.readerRunning);
+
+    backend.touch();
+    backend.touch();
+    EXPECT_EQ(controller.state(), AuthController::Succeeded);
+    EXPECT_EQ(successes, 1);
+    EXPECT_EQ(backend.acceptCount, 1);
+}
+
+TEST(AuthControllerTest, AFailedPasswordGivesTheReaderBackAtOnce)
+{
+    FakeBackend backend;
+    backend.hasReader = true;
+    backend.enrolled = true;
+    AuthController controller(AuthController::Lock, &backend);
+    controller.start();
+
+    controller.authenticate("wrong");
+    EXPECT_FALSE(backend.readerRunning);
+    EXPECT_EQ(backend.fingerprintStopCount, 1);
+
+    backend.reject();
+    EXPECT_EQ(controller.state(), AuthController::Failed);
+    EXPECT_TRUE(backend.readerRunning);
+    EXPECT_EQ(backend.fingerprintStartCount, 2);
+
+    controller.reset();
+    EXPECT_EQ(backend.fingerprintStopCount, 1);
+    EXPECT_EQ(backend.fingerprintStartCount, 2);
+
+    backend.touch();
+    EXPECT_EQ(controller.state(), AuthController::Succeeded);
+}
+
+TEST(AuthControllerTest, TheReaderIsNeverOfferedAtLoginOrWithoutOne)
+{
+    FakeBackend loginBackend;
+    loginBackend.hasReader = true;
+    loginBackend.enrolled = true;
+    AuthController login(AuthController::Login, &loginBackend);
+    login.start();
+    login.authenticate("wrong");
+    loginBackend.reject();
+    EXPECT_EQ(loginBackend.fingerprintStartCount, 0);
+
+    FakeBackend lockBackend;
+    AuthController lock(AuthController::Lock, &lockBackend);
+    lock.start();
+    lock.authenticate("wrong");
+    lockBackend.reject();
+    EXPECT_EQ(lockBackend.fingerprintStartCount, 0);
+}
+
+TEST(AuthControllerTest, SomeoneAtTheLockOrAWakeOffersTheReaderAgain)
+{
+    FakeBackend backend;
+    backend.hasReader = true;
+    backend.enrolled = true;
+    AuthController controller(AuthController::Lock, &backend);
+    controller.start();
+    EXPECT_EQ(backend.fingerprintStartCount, 1);
+
+    controller.userActive();
+    EXPECT_EQ(backend.fingerprintStartCount, 2);
+
+    backend.wake();
+    EXPECT_EQ(backend.fingerprintStartCount, 3);
+    EXPECT_TRUE(backend.readerRunning);
+
+    controller.authenticate("checking");
+    controller.userActive();
+    backend.wake();
+    EXPECT_EQ(backend.fingerprintStartCount, 3);
+    EXPECT_FALSE(backend.readerRunning);
+
+    backend.succeed();
+    controller.userActive();
+    backend.wake();
+    EXPECT_EQ(backend.fingerprintStartCount, 3);
+}
+
+TEST(AuthControllerTest, WithoutAnEnrolledFingerThePasswordLeads)
+{
+    FakeBackend backend;
+    backend.hasReader = true;
+    AuthController controller(AuthController::Lock, &backend);
+    int changes = 0;
+    auto changed = controller.fingerprintChanged.connect([&] { ++changes; });
+
+    controller.start();
+    EXPECT_EQ(backend.enrollmentCheckCount, 1);
+    EXPECT_FALSE(controller.fingerprintOffered());
+    EXPECT_EQ(backend.fingerprintStartCount, 0);
+
+    backend.setEnrolled(true);
+    EXPECT_EQ(changes, 1);
+    EXPECT_TRUE(controller.fingerprintOffered());
+    EXPECT_TRUE(backend.readerRunning);
+
+    backend.setEnrolled(false);
+    EXPECT_EQ(changes, 2);
+    EXPECT_FALSE(controller.fingerprintOffered());
+    EXPECT_FALSE(backend.readerRunning);
+
+    FakeBackend loginBackend;
+    loginBackend.hasReader = true;
+    loginBackend.enrolled = true;
+    AuthController login(AuthController::Login, &loginBackend);
+    login.start();
+    EXPECT_EQ(loginBackend.enrollmentCheckCount, 0);
+    EXPECT_FALSE(login.fingerprintOffered());
+}
+
+TEST(AuthControllerTest, ThreeMisreadFingersAskForThePasswordAndFiveEndTheReader)
+{
+    FakeBackend backend;
+    backend.hasReader = true;
+    backend.enrolled = true;
+    AuthController controller(AuthController::Lock, &backend);
+    int asked = 0;
+    auto askedForPassword = controller.passwordAsked.connect([&] { ++asked; });
+    controller.start();
+
+    backend.mismatch();
+    backend.mismatch();
+    EXPECT_EQ(asked, 0);
+    backend.mismatch();
+    EXPECT_EQ(asked, 1);
+    EXPECT_FALSE(controller.fingerprintLockedOut());
+    backend.mismatch();
+    EXPECT_EQ(asked, 2);
+
+    const int stops = backend.fingerprintStopCount;
+    backend.mismatch();
+    EXPECT_EQ(asked, 3);
+    EXPECT_TRUE(controller.fingerprintLockedOut());
+    EXPECT_EQ(backend.fingerprintStopCount, stops + 1);
+    EXPECT_TRUE(controller.fingerprintOffered());
+
+    const int starts = backend.fingerprintStartCount;
+    controller.userActive();
+    backend.wake();
+    EXPECT_EQ(backend.fingerprintStartCount, starts);
+    backend.touch();
+    EXPECT_NE(controller.state(), AuthController::Succeeded);
+
+    controller.authenticate("right");
+    backend.succeed();
+    EXPECT_EQ(controller.state(), AuthController::Succeeded);
+}

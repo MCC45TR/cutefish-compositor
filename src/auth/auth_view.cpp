@@ -88,6 +88,15 @@ public:
         m_animation.start();
     }
 
+    // Without animating, as for a change nobody sees.
+    void setValue(T value)
+    {
+        m_initialized = true;
+        m_animation.stop();
+        m_value = m_to = value;
+        m_changed();
+    }
+
 private:
     ui::Animation m_animation;
     std::function<T(T, T, double)> m_interpolate;
@@ -916,13 +925,21 @@ public:
                  [this] { m_pill->requestPaint(); })
         , m_border(window, 140, ui::Animation::Easing::Linear, colorInterpolation(),
                    [this] { m_pill->requestPaint(); })
+        , m_reveal(window, 180, ui::Animation::Easing::OutCubic, numberInterpolation(), [this] {
+            m_pill->setOpacity(m_reveal.value());
+            m_caption->setOpacity(1 - m_reveal.value());
+            // Over the input, so it must not take the pointer once gone.
+            m_caption->setVisible(m_reveal.value() < 1);
+        })
         , m_shake(window)
     {
         m_pill = addChild<Pill>(this);
         m_prompt = m_pill->addChild<ui::Label>();
         m_prompt->setFontSize(13);
         m_prompt->setColor(white(0.72));
-        m_prompt->setElide(ui::Label::Elide::None);
+        // The pill is sized for a password, not a sentence: a long prompt ends
+        // in an ellipsis inside the field instead of running past its edge.
+        m_prompt->setElide(ui::Label::Elide::Right);
         m_prompt->setFadesWhenDisabled(false);
         m_input = m_pill->addChild<PasswordInput>();
         m_input->onTextChanged = [this] { update(); };
@@ -936,6 +953,14 @@ public:
             onAccepted(m_input->text());
         };
         m_go = m_pill->addChild<GoButton>(window, this);
+        m_caption = addChild<RaisedLabel>(13, 400, white(0.76), kBlack.withAlpha(0.35));
+        m_caption->setName("fingerprint-caption");
+        m_caption->setElidedCentred();
+        m_cover = addChild<Clickable>();
+        m_cover->onClicked = [this] {
+            if (onRevealRequested)
+                onRevealRequested();
+        };
 
         m_shake.setDuration(std::chrono::milliseconds(400));
         m_shake.setEasing(ui::Animation::Easing::Linear);
@@ -945,8 +970,29 @@ public:
 
     std::function<void(const std::string &password)> onAccepted;
     std::function<void()> onEdited;
+    std::function<void()> onRevealRequested;
 
     PasswordInput *input() const { return m_input; }
+
+    // Held back until it is asked for: the pill gives its slot to the caption,
+    // so nothing around it moves, and the input keeps the keyboard so the
+    // first key typed is not lost. The first call sets the state at once.
+    void setCollapsed(bool collapsed, bool animated)
+    {
+        m_cover->setVisible(collapsed);
+        if (animated)
+            m_reveal.setTarget(collapsed ? 0 : 1);
+        else
+            m_reveal.setValue(collapsed ? 0 : 1);
+    }
+
+    void setCaption(const std::string &text)
+    {
+        m_caption->setText(text);
+        requestLayout();
+    }
+
+    double revealOpacity() const { return m_reveal.value(); }
 
     void setPlaceholder(const std::string &text)
     {
@@ -999,10 +1045,15 @@ protected:
         const ui::RectF rect = localRect();
         m_pill->setGeometry({rect.x + m_shakeOffset, rect.y, rect.width, rect.height});
         const ui::SizeF prompt = m_prompt->sizeHint();
-        m_prompt->setGeometry({14, centeredStart(rect.height, prompt.height), prompt.width,
-                               prompt.height});
+        // The text stops where the input stops, before the button.
+        const double promptSpace = std::max(0.0, rect.width - 14.0 - 40.0);
+        m_prompt->setGeometry({14, centeredStart(rect.height, prompt.height),
+                               std::min(prompt.width, promptSpace), prompt.height});
         m_input->setGeometry({14, 0, rect.width - 14 - 40, rect.height});
         m_go->setGeometry({rect.width - 4 - 24, centeredStart(rect.height, 24), 24, 24});
+        const double caption = m_caption->sizeHint().height;
+        m_caption->setGeometry({rect.x, rect.y + centeredStart(rect.height, caption), rect.width, caption});
+        m_cover->setGeometry(rect);
     }
 
 private:
@@ -1101,8 +1152,11 @@ private:
     ui::Label *m_prompt = nullptr;
     PasswordInput *m_input = nullptr;
     GoButton *m_go = nullptr;
+    RaisedLabel *m_caption = nullptr;
+    Clickable *m_cover = nullptr;
     ColorBehavior m_fill;
     ColorBehavior m_border;
+    NumberBehavior m_reveal;
     ui::Animation m_shake;
     double m_shakeOffset = 0;
     double m_shakeFrom = 0;
@@ -1128,6 +1182,51 @@ public:
         m_label->setText(message);
         m_opacity.setTarget(shown && !message.empty() ? 1 : 0);
         requestLayout();
+    }
+
+    ui::SizeF sizeHint() const override { return {0, 20}; }
+
+protected:
+    void layout() override
+    {
+        const double height = m_label->sizeHint().height;
+        m_label->setGeometry({0, centeredStart(geometry().height, height), geometry().width, height});
+    }
+
+private:
+    NumberBehavior m_opacity;
+    RaisedLabel *m_label;
+};
+
+// The neutral counterpart of ErrorLabel, under the password field: it says the
+// reader unlocks too, and a click on it asks for the field. Its row is kept
+// while there is a message, shown or not, and takes no room otherwise.
+class HintLabel final : public Clickable
+{
+public:
+    explicit HintLabel(ui::Window *window)
+        : m_opacity(window, 180, ui::Animation::Easing::OutCubic, numberInterpolation(),
+                    [this] { setOpacity(m_opacity.value()); })
+    {
+        m_label = addChild<RaisedLabel>(13, 400, white(0.76), kBlack.withAlpha(0.35));
+        m_label->setElidedCentred();
+        m_opacity.setTarget(0);
+        setVisible(false);
+    }
+
+    void setMessage(const std::string &message, bool shown, bool animated)
+    {
+        m_label->setText(message);
+        const bool kept = !message.empty();
+        if (isVisible() != kept) {
+            // A row without a message would still take a gap in the column.
+            setVisible(kept);
+            requestLayout();
+        }
+        if (animated)
+            m_opacity.setTarget(shown ? 1 : 0);
+        else
+            m_opacity.setValue(shown ? 1 : 0);
     }
 
     ui::SizeF sizeHint() const override { return {0, 20}; }
@@ -1233,6 +1332,11 @@ AuthScreen::AuthScreen(ui::Window *window, AuthController *controller)
     m_password->setLayoutHints(centred(true));
     m_password->setPlaceholder(tr("Enter Password"));
     m_password->setVisible(m_controller->passwordRequired());
+    m_password->onRevealRequested = [this] { revealPassword(); };
+    m_fingerprint = m_pod->addChild<HintLabel>(window);
+    m_fingerprint->setName("fingerprint-hint");
+    m_fingerprint->setLayoutHints(centred(true));
+    m_fingerprint->onClicked = [this] { revealPassword(); };
     m_unlock = m_pod->addChild<UnlockPrompt>();
     m_unlock->setName("unlock-prompt");
     m_unlock->setLayoutHints(centred(true));
@@ -1319,6 +1423,12 @@ AuthScreen::AuthScreen(ui::Window *window, AuthController *controller)
     m_subscriptions.push_back(m_controller->sessionsChanged.connect(sessionsChanged));
     m_subscriptions.push_back(m_controller->sessionChanged.connect(sessionsChanged));
     m_subscriptions.push_back(m_controller->stateChanged.connect(stateChanged));
+    m_subscriptions.push_back(m_controller->fingerprintChanged.connect([this] { updateFingerprint(); }));
+    m_subscriptions.push_back(m_controller->passwordAsked.connect([this] {
+        revealPassword();
+        m_password->shake();
+        focusPassword();
+    }));
     m_subscriptions.push_back(m_controller->authenticationFailed.connect([this] {
         m_password->clear();
         m_password->shake();
@@ -1329,6 +1439,7 @@ AuthScreen::AuthScreen(ui::Window *window, AuthController *controller)
     userChanged();
     sessionsChanged();
     stateChanged();
+    updateFingerprint();
 
     m_clockTimer.setSingleShot(true);
     m_clockTimer.onTimeout = [this] { tick(); };
@@ -1344,8 +1455,33 @@ void AuthScreen::retranslate()
 {
     m_userName->retranslate();
     m_password->setPlaceholder(tr("Enter Password"));
+    updateFingerprint();
     m_unlock->retranslate();
     tick();
+}
+
+void AuthScreen::updateFingerprint()
+{
+    const bool offered = m_controller->fingerprintOffered();
+    const bool lockedOut = m_controller->fingerprintLockedOut();
+    std::string message;
+    if (offered)
+        message = lockedOut ? tr("Password Required") : tr("Fingerprint or Password");
+    const bool collapsed = offered && !lockedOut && !m_passwordRevealed;
+    // The panel is prepared out of sight before the lock; it settles there at
+    // once, or the first frame would play the change.
+    const bool animated = m_blocked;
+    m_password->setCaption(message);
+    m_password->setCollapsed(collapsed, animated);
+    m_fingerprint->setMessage(message, !collapsed, animated);
+}
+
+void AuthScreen::revealPassword()
+{
+    if (m_passwordRevealed)
+        return;
+    m_passwordRevealed = true;
+    updateFingerprint();
 }
 
 void AuthScreen::setBlocked(bool blocked)
@@ -1384,7 +1520,7 @@ base::RectF AuthScreen::fieldBounds() const
 
 double AuthScreen::fieldOpacity() const
 {
-    return 1 - m_pickerProgress;
+    return (1 - m_pickerProgress) * m_password->revealOpacity();
 }
 
 bool AuthScreen::canSwitchUser() const
